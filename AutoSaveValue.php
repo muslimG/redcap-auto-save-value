@@ -43,7 +43,7 @@ class AutoSaveValue extends AbstractExternalModule
         'yesno'
     ];
 
-    public function redcap_data_entry_form(int $project_id, string $record, string $instrument, int $event_id, ?int $group_id, int $repeat_instance=1) {
+    public function redcap_data_entry_form(int $project_id, ?string $record, string $instrument, int $event_id, ?int $group_id, int $repeat_instance=1) {
         if (is_null($record)) return; // cannot autosave until record exists (not on new record or first page of public survey)
         if (isset($_GET['em_preview_instrument']) && $_GET['em_preview_instrument']=='1') return; // don't save if previewing from designer using Preview Instrument EM
         global $Proj, $draft_preview_enabled;
