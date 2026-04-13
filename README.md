@@ -35,6 +35,6 @@ Auto-saving on data entry forms is **\*not compatible\*** with the "Require reas
 
 ## Example
 
-<img alt="demonstration of auto-saving values on page load and after update" src="https://redcap.mcri.edu.au/surveys/index.php?pid=14961&__passthru=DataEntry%2Fimage_view.php&doc_id_hash=645acfe62abcae8fff3748da04ee1f1e9e67b52d&id=2143399&s=ZQvnHwJkw3zdumAQ&page=file_page&record=17&event_id=47634&field_name=thefile&instance=1" />
+<img alt="demonstration of auto-saving values on page load and after update" src="https://redcap.mcri.edu.au/surveys/index.php?pid=14961&__passthru=DataEntry%2Fimage_view.php&doc_id_hash=354a1e758d038e46c505fda03fe71ab227125c074467b960ca8be5d895aee4d481f70a2590f22e5ee85eab21db215630c9a4d2b96be19f0cd1ae86af4eca9450&id=2143399&s=ZQvnHwJkw3zdumAQ&page=file_page&record=17&event_id=47634&field_name=thefile&instance=1" />
 
 ********************************************************************************
