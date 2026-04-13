@@ -58,7 +58,7 @@ class AutoSaveValue extends AbstractExternalModule
         $this->includeSaveFunctions($pf);
     }
 
-    public function redcap_survey_page(int $project_id, ?string $record, string $instrument, int $event_id, ?int $group_id, string $survey_hash, ?int $response_id, int $repeat_instance = 1) {
+    public function redcap_survey_page(int $project_id, ?string $record, string $instrument, int $event_id, ?int $group_id, string $survey_hash, ?string $response_id, int $repeat_instance = 1) {
         if (is_null($record)) return; // cannot autosave until record exists (not on new record or first page of public survey)
         global $pageFields;
         $this->noauth = true;
