@@ -23,7 +23,7 @@ Action tags to trigger automatic saving of field values during data entry:
 
 ### "Require Reason for Change" Option
 
-Auto-saving on data entry forms does **\*not trigger\** the "Require reason for change" dialog box when this option is enabled in a project. Instead, a default text value of "auto_save_value" is recorded as the reason for change. There are two options for customising this text:
+Auto-saving on data entry forms does **\*not\*** trigger the "Require reason for change" dialog box when this option is enabled in a project. Instead, a default text value of "auto_save_value" is recorded as the reason for change. There are two options for customising this text:
 
 1. When the "Require reason for change" option is enabled in the project, the Module Configuration settings dialog shows an option where the desired default value may be entered.
 2. The default text is written into a hdden HTML element in the page: `<span id="AutoSaveReason" class="d-none">auto_save_value</span>`. Updating the text content of this element using a client-side script will have the altered text submitted as the "reason for change" instead.
