@@ -35,5 +35,12 @@
         }
     ],
     "system-settings": [ ],
-	"project-settings": [ ]
+	"project-settings": [
+        {
+            "key": "default-reason-for-change",
+            "name": "Text for \"reason for change\" (default is \"auto_save_value\")",
+            "type": "text",
+            "hidden": true
+        }
+    ]
 }

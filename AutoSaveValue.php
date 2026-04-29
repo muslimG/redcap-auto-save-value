@@ -113,6 +113,11 @@ class AutoSaveValue extends AbstractExternalModule
         $this->autoSaveOnLoadFields = array_values(array_intersect($this->autoSaveFields, $fieldsDefaultOrSetvalue));
         $this->defaultNoAutoSaveFields = array_values(array_diff($fieldsDefaultOrSetvalue, $this->autoSaveFields));
 
+        // write default reason text to document rather than into JS so as to give opportunity to modify text outside of this module
+        $default_reason = $this->getProjectSetting('default-reason-for-change');
+        $default_reason = (empty($default_reason)) ? $this->PREFIX : $default_reason;
+        echo '<span id="AutoSaveReason" class="d-none">'.$this->escape(\REDCap::filterHtml($default_reason)).'</span>';
+
         $this->initializeJavascriptModuleObject();
         $this->jsObjName = $this->getJavascriptModuleObjectName();
         ?>
@@ -242,7 +247,7 @@ class AutoSaveValue extends AbstractExternalModule
                     module.getFieldIcon(field,'save').hide();
                     module.getFieldIcon(field,'fail').hide();
                     module.singleFieldChange = !dataEntryFormValuesChanged;
-                    module.ajax('<?=static::AUTOSAVE_ACTION?>', [field, value]).then(function(response) {
+                    module.ajax('<?=static::AUTOSAVE_ACTION?>', [field, value, $('#AutoSaveReason').text()]).then(function(response) {
                         module.getFieldIcon(field,'default').removeClass('pulse').hide();
                         if (response) {
                             module.saveSuccess(field);
@@ -263,6 +268,9 @@ class AutoSaveValue extends AbstractExternalModule
                 };
 
                 module.init = function() {
+                    if ($('#autosave-default-comment')) {
+                        module.defaultComment = $('#autosave-default-comment').text();
+                    }
                     module.autoSaveFields.forEach((asf) => { 
                         module.appendIcons(asf);
                         module.addUpdateHander(asf);
@@ -304,6 +312,18 @@ class AutoSaveValue extends AbstractExternalModule
             if (!isset($payload[1])) throw new \Exception("Field $field no value supplied");
             $value = $payload[1]; // nb do not use $this->escape() here because altering e.g. & in text values submitted to &amp; is undesirable 
 
+            $saveArray = array(
+                'dataFormat' => 'json-array', 
+                'overwriteBehavior' => 'overwrite'
+            );
+
+            if ($Proj->project['require_change_reason']=='1') {
+                $changeReasons = array();
+                $changeReasonText = (isset($payload[2])) ? htmlspecialchars($payload[2], ENT_QUOTES) : $this->PREFIX;
+                $changeReasons[$record][$event_id] = $changeReasonText;
+                $saveArray['changeReasons'] = $changeReasons;
+            }
+
             $saveData = array(
                 $Proj->table_pk => $this->record,
                 $field => $this->formatSaveValue($field, $value)
@@ -321,7 +341,9 @@ class AutoSaveValue extends AbstractExternalModule
                 $saveData['redcap_repeat_instance'] = $this->instance;
             }
 
-            $saveResult = \REDCap::saveData('json', json_encode(array($saveData)), 'overwrite');
+            $saveArray['data'] = array($saveData);
+
+            $saveResult = \REDCap::saveData($saveArray);
 
             if (isset($saveResult['errors']) && !empty($saveResult['errors'])) {
                 $detail = "Field: $field; Value: $value";
@@ -352,5 +374,26 @@ class AutoSaveValue extends AbstractExternalModule
         // nb do not use $this->escape() here because altering e.g. & in text values submitted to &amp; is undesirable 
         // save data gets validated and sanitised in REDCap::saveData()
         return $value;
+    }
+
+    /**
+     * redcap_module_configuration_settings
+     * Triggered when the system or project configuration dialog is displayed for a given module.
+     * Allows dynamically modify and return the settings that will be displayed.
+     * @param string $project_id, $settings
+     */
+    public function redcap_module_configuration_settings($project_id, $settings) {
+        if (!empty($project_id)) {
+            global $Proj;
+            if ($Proj->project['require_change_reason']=='1') {
+                foreach ($settings as $si => $sarray) {
+                    if ($sarray['key']=='default-reason-for-change') {
+                        $settings[$si]['hidden'] = false;
+                        break;
+                    }
+                }
+            }
+        }
+        return $settings;
     }
 }
