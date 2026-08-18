@@ -1,32 +1,19 @@
 /**
- * Auto-Save Value, offline layer
+ * Auto-Save Value, offline layer.
  *
- * Three jobs, in order of how much we care about them:
- *  1. never lose what somebody has typed, even if the page dies
- *  2. get it to the server as soon as the network allows
- *  3. never quietly overwrite somebody else's edit
+ * Mirrors the open form into encrypted browser storage and drips changed values
+ * back to the server on a queue that survives the wifi going away.
  *
- * Everything on the device is encrypted with a key the browser will not let us
- * read back, so the drafts are useless if the storage is lifted off the tablet.
- *
- * Two rules the rest of this file follows, both learned the hard way:
- *
- *  - the DOM is the truth. Nothing is bookkept incrementally; the pending set is
- *    rebuilt from what is on the screen. That is what makes a deletion behave
- *    like any other edit instead of vanishing.
- *  - every tab mirrors to the device, always. Only sending is restricted to one
- *    tab at a time. An earlier version stood a second tab down completely, and
- *    everything typed into it was lost, which is a worse bug than the clobbering
- *    it was meant to prevent.
+ * Two rules hold the design together. The DOM is the truth: the pending set is
+ * always rebuilt from what is on screen, never bookkept, which is what makes a
+ * deletion behave like any other edit. And every tab mirrors locally; only
+ * sending is restricted to one tab at a time.
  */
 $(function() {
     'use strict';
 
-    // The action-tag layer hangs its own save(), init() and findInput() off the
-    // external module object. This layer therefore keeps all of its state on a
-    // separate object and borrows the module object for one thing only, ajax(),
-    // which is the transport. Two layers sharing one namespace would be a very
-    // quiet source of bugs.
+    // The action-tag layer already hangs save(), init() and findInput() off the
+    // module object, so keep our state somewhere else and borrow only ajax().
     let module = (window.AutoSaveOffline = {});
     let transport = AutoSaveValueModule;
     let cfg = AutoSaveOfflineSettings;
@@ -80,14 +67,11 @@ $(function() {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Every tab gets its own draft, so two tabs on one record cannot overwrite
-     * each other's unsaved work. sessionStorage is the right home for the token:
-     * it survives a reload and a captive portal bounce, which is the case this
-     * module exists for, and it dies with the tab.
-     *
-     * The catch is that opening a link in a new tab copies sessionStorage, so the
-     * clone starts life holding somebody else's token. Ask on a broadcast channel
-     * whether anyone is already using it, and mint a new one if they answer.
+     * A per-tab token, so two tabs on one record keep separate drafts.
+     * sessionStorage survives a reload and a captive portal bounce but dies with
+     * the tab, which is exactly the lifetime we want. Snag: opening a link in a
+     * new tab copies sessionStorage, so ask around first and mint a fresh token
+     * if another tab answers to this one.
      */
     module.settleTabToken = function() {
         let stored = null;
@@ -129,11 +113,9 @@ $(function() {
     };
 
     /**
-     * A form that was genuinely submitted has been dealt with, so its draft must
-     * not be offered to whatever the tab is pointed at next. This matters most
-     * for new records, where consecutive participants would otherwise share one
-     * draft key. The flag is cleared again if the page is still here two seconds
-     * later, because REDCap cancels its own submit for required fields.
+     * Remember that a submit really happened, so a spent draft is not offered to
+     * whatever the tab loads next. Cleared again after two seconds, because
+     * REDCap cancels its own submit when a required field is empty.
      */
     module.markSubmitted = function() {
         try { sessionStorage.setItem(module.SUBMIT_FLAG, String(Date.now())); } catch (e) {}
@@ -155,11 +137,9 @@ $(function() {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Web Locks does exactly what is wanted here: the lock is held for as long as
-     * the promise is unresolved, and the browser releases it the moment the tab
-     * goes away, crash included. No heartbeat, no stale lease, no two tabs both
-     * believing they are in charge. The localStorage fallback below is only for
-     * browsers without it.
+     * Web Locks is ideal here: held while the promise is unresolved, released by
+     * the browser when the tab dies, crash included. No heartbeat to get wrong.
+     * The localStorage lease below is only for browsers that lack it.
      */
     module.electLeader = function() {
         if (navigator.locks && navigator.locks.request) {
@@ -185,11 +165,9 @@ $(function() {
             }
 
             if (held && held.tab != module.tabToken && (now - held.at) < module.LEASE_STALE) {
-                // somebody else holds it. If that somebody is not us and we
-                // thought we were in charge, stand down: a background tab's
-                // timers are throttled to once a minute, so losing a six second
-                // lease without noticing is routine, and two senders is exactly
-                // what this election exists to prevent.
+                // Lost it. Stand down rather than becoming a second sender:
+                // background tabs get throttled to one timer a minute, so
+                // quietly losing a six second lease is routine.
                 if (module.isLeader) {
                     module.isLeader = false;
                     module.setStatus();
@@ -208,8 +186,8 @@ $(function() {
     module.becomeLeader = function() {
         if (module.isLeader) return;
         module.isLeader = true;
-        // deliberately no re-reading of the baseline here. It was captured when
-        // this page loaded, and anything typed since then is a real change.
+        // no re-reading the baseline: anything typed while standing by is a
+        // real change and still needs sending
         module.setStatus();
         if (Object.keys(module.pending).length) module.flush();
     };
@@ -285,10 +263,9 @@ $(function() {
     };
 
     /**
-     * One AES-GCM key per browser, generated once and kept as a CryptoKey rather
-     * than as bytes. extractable:false means there is no way to read the key back
-     * out again, not from here and not from the console, so lifting the IndexedDB
-     * file off the device gets you ciphertext and nothing else.
+     * One AES-GCM key per user per browser, stored as a CryptoKey rather than as
+     * bytes. extractable:false means nothing can read the key back out, so
+     * lifting the IndexedDB files off the tablet yields ciphertext and no key.
      */
     module.loadKey = async function() {
         let keyName = 'aes:' + cfg.user;
@@ -315,9 +292,9 @@ $(function() {
     };
 
     /**
-     * Queued behind whatever draft write is already in flight. Two encrypt calls
-     * finishing out of order would otherwise leave the older snapshot on disk,
-     * which is the one thing a draft store must never do.
+     * Chained behind any write already in flight. Two encrypts finishing out of
+     * order would leave the older snapshot on disk, which is the one thing a
+     * draft store must never do.
      */
     module.saveDraft = function() {
         if (!module.db || !module.cryptoKey || !module.draftId) return module.draftChain;
@@ -346,9 +323,9 @@ $(function() {
     };
 
     /**
-     * Our own draft first. Failing that, a draft left behind by a tab that died
-     * on the same record: that is the whole point of the exercise, and per-tab
-     * keys would otherwise make an orphan unreachable.
+     * Ours first; failing that, one orphaned by a tab that died on this record.
+     * Without the orphan scan, per-tab keys would make a crashed tab's work
+     * unreachable, which defeats the point.
      */
     module.readDraft = async function() {
         let row = await module.idbGet(module.STORE_DRAFTS, module.draftId);
@@ -365,9 +342,9 @@ $(function() {
             opened.fromAnotherTab = (row.tab != module.tabToken);
             return opened;
         } catch (err) {
-            // Wrong key. Almost always a different user on the same tablet, whose
-            // draft this is. Leave it alone: deleting it would destroy somebody
-            // else's unsaved work to tidy up our own screen. TTL will clear it.
+            // Wrong key, so this draft belongs to another user on this tablet.
+            // Leave it: deleting someone else's unsaved work to tidy our own
+            // screen is not a trade worth making. TTL will clear it.
             console.log('Auto-Save Value: a draft here could not be opened with this key, leaving it');
             return null;
         }
@@ -414,8 +391,7 @@ $(function() {
     /* reading and writing the form                                        */
     /* ------------------------------------------------------------------ */
 
-    // field names come from the project's own data dictionary, but they are
-    // still being pasted into a selector, so put them through the escaper
+    // field names are trusted-ish, but they still end up inside a selector
     module.sel = function(name) {
         if (window.CSS && CSS.escape) return CSS.escape(name);
         return String(name).replace(/["\\]/g, '\\$&');
@@ -423,21 +399,14 @@ $(function() {
 
 
     /**
-     * One checkbox choice, as REDCap actually renders it.
+     * One checkbox choice, as REDCap 17 really renders it:
      *
-     * Verified against REDCap 17.0.3 on 14 Aug 2026, because this was wrong
-     * before and nothing caught it: the mock form used in the tests had invented
-     * the markup. Real REDCap renders a choice as
+     *   <input type=hidden   name="__chk__<field>_RC_<code>">      holds the code
+     *   <input type=checkbox id="id-__chk__<field>_RC_<code>" name="__chkn__<field>">
      *
-     *   <input type="checkbox" id="id-__chk__<field>_RC_<code>" name="__chkn__<field>" value="on">
-     *
-     * with a hidden partner <input name="__chk__<field>_RC_<code>"> that carries
-     * the code when ticked and an empty string when not. There is no element
-     * anywhere named <field>___<code>; that is the name the saveData API wants,
-     * which is a different thing and is why the server side was right all along.
-     *
-     * getElementById rather than a name selector, because the id is unique and
-     * needs no escaping.
+     * Note what is NOT there: nothing is named <field>___<code>. That is the name
+     * saveData wants, which is a different thing entirely, and confusing the two
+     * meant checkbox support silently did nothing for three review rounds.
      */
     module.checkboxInput = function(field, code) {
         let byId = document.getElementById('id-__chk__' + field + '_RC_' + code);
@@ -469,7 +438,7 @@ $(function() {
         return input.val();
     };
 
-    /** which choices of a checkbox group this page actually rendered */
+    /** the choices this page actually rendered, which is not always all of them */
     module.visibleChoices = function(field) {
         let spec = cfg.fields[field];
         if (!spec || spec.type != 'checkbox') return null;
@@ -488,10 +457,10 @@ $(function() {
     };
 
     /**
-     * Radios and checkboxes get a real click rather than a property assignment.
-     * REDCap keeps the submitted value in a parallel hidden input that only its
-     * own handler updates, so setting .checked alone shows the right thing on
-     * screen and submits the wrong thing.
+     * Radios and checkboxes need a real click, not .checked = true. REDCap keeps
+     * the submitted value in a parallel hidden input that only its own handler
+     * updates, so assigning the property shows the right thing and submits the
+     * wrong one.
      */
     module.writeField = function(field, value) {
         let spec = cfg.fields[field];
@@ -518,10 +487,9 @@ $(function() {
                 if (!button.prop('checked')) button.trigger('click');
                 return;
             }
-            // No rendered button carries this value: a missing-data code, or a
-            // choice hidden by @HIDECHOICE. Clear the group first, otherwise the
-            // screen keeps showing the old answer while the submitted value
-            // changes underneath it.
+            // No button carries this value: a missing-data code, or one hidden
+            // by @HIDECHOICE. Clear the group, or the screen keeps the old
+            // answer while the stored value changes underneath it.
             module.clearRadio(field);
         }
 
@@ -533,24 +501,16 @@ $(function() {
     };
 
     /**
-     * Clearing a radio is not the same as clicking one. There is no button whose
-     * value is blank, so an earlier version did nothing at all and left the
-     * visible button selected while the stored value went empty.
-     *
-     * REDCap's own reset link is the right tool where it exists, but it has to be
-     * matched on the exact field name. A substring match picks up the link for
-     * pain_score when asked to clear pain, and then clears the wrong field.
+     * Clearing a radio is not clicking one: no button has a blank value, so both
+     * halves have to be undone by hand. REDCap renders a reset link,
+     * radioResetVal('<field>','form'), but calling it on 17.0.3 does nothing at
+     * all, tested on a live form. So ignore the link. Side benefit: with no link
+     * to match, there is no way to match the wrong field's link.
      */
     module.clearRadio = function(field) {
         let group = $('input[type=radio][name="' + module.sel(field + '___radio') + '"]');
         if (!group.filter(':checked').length) return;
 
-        // REDCap does render a reset link, radioResetVal('<field>','form'), but
-        // calling it on 17.0.3 has no effect: tested on a live form, the value
-        // and the checked state both survived it. So undo both halves by hand,
-        // which was tested on the same form and does work. Doing it this way also
-        // removes a whole class of bug, because there is no link to match and so
-        // no way to match the wrong field's link.
         group.prop('checked', false);
         let hidden = $('[name="' + module.sel(field) + '"]').not('[type=radio]').first();
         if (hidden.length) {
@@ -560,9 +520,8 @@ $(function() {
     };
 
     /**
-     * Put a draft back. A blank in the draft is never written over something the
-     * user has already typed since the page came back, because the restore button
-     * is a recovery action and must not be able to destroy work.
+     * Put a draft back. A recovery action must never destroy work, so anything
+     * the user has touched since the page loaded is left alone.
      */
     module.writeForm = function(values, onlyThese) {
         let skipped = [];
@@ -574,12 +533,10 @@ $(function() {
             let draftBlank = (draftValue === '' || (Array.isArray(draftValue) && !draftValue.length));
             let liveBlank = (live === null || live === '' || (Array.isArray(live) && !live.length));
 
-            // Is the box still showing what the page loaded with, or has the user
-            // typed into it since? The baseline is what REDCap rendered from the
-            // database on this load, so anything different is the user's own new
-            // work and must not be overwritten by a restore. Anything the same is
-            // just the older server value, which is exactly what the draft is
-            // here to replace.
+            // The baseline is what REDCap rendered from the database on this
+            // load. Still matching it means the box holds the old server value,
+            // which is what the draft is here to replace. Different means the
+            // user has typed since, and that is theirs.
             let untouchedSinceLoad = !module.valuesDiffer(live, module.baseline[field]);
             if (!untouchedSinceLoad) { skipped.push(field); return; }
             if (draftBlank && !liveBlank) { skipped.push(field); return; }
@@ -589,13 +546,10 @@ $(function() {
         return skipped;
     };
 
-    // the autocomplete dropdowns keep the label in a sibling text box
     /**
-     * The autocomplete dropdown keeps its label in a separate visible box. REDCap
-     * gives that box a unique id, rc-ac-input_<field>, which is what to target:
-     * a container search picks up every autocomplete in the same block, and a
-     * descriptive field with two embedded autocompletes will then show one
-     * field's label against the other field's box.
+     * An autocomplete dropdown shows its label in a separate box, which REDCap
+     * gives the id rc-ac-input_<field>. Target that, not the container: two
+     * autocompletes in one block would otherwise swap labels.
      */
     module.syncAutocompleteLabel = function(input) {
         if (!input.is('select.rc-autocomplete')) return;
@@ -612,13 +566,10 @@ $(function() {
     };
 
     /**
-     * Joined on a space, not on nothing. ['1','23'] and ['12','3'] both come out
-     * as "123" if you join on the empty string, so two genuinely different sets
-     * of ticks compared as equal and the change was dropped. Any checkbox with
-     * ten or more choices could hit that.
-     *
-     * An array against a string is a mismatch of shapes, not of values, and it
-     * used to throw and take the whole module down with it.
+     * Joined on a space, not on nothing: ['1','23'] and ['12','3'] both collapse
+     * to "123" otherwise, and two different sets of ticks compare as equal. Any
+     * checkbox with ten or more choices can hit it. Mismatched shapes simply
+     * differ rather than throwing.
      */
     module.valuesDiffer = function(a, b) {
         let aList = Array.isArray(a), bList = Array.isArray(b);
@@ -636,10 +587,9 @@ $(function() {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Rebuild the pending set from what is on the screen right now, rather than
-     * bookkeeping it incrementally. Doing it this way is what makes a deletion
-     * behave like any other edit: an emptied box differs from what the server
-     * holds, so it goes back in the queue instead of quietly disappearing.
+     * Rebuild the pending set from the screen, every time. Nothing is ever
+     * removed because we saved it; it is absent next time only if screen and
+     * server now agree. That is what stops a deletion vanishing.
      */
     module.recomputePending = function() {
         let now = module.readForm();
@@ -647,17 +597,16 @@ $(function() {
         Object.keys(now).forEach(function(field) {
             let value = now[field];
 
-            // the user has gone back and changed a field somebody else also
-            // changed. Take that as their answer: their text wins, over the
-            // value the server reported.
+            // they have edited a field that was in conflict. Take that as the
+            // answer: their correction wins.
             if (module.conflicted[field] && module.valuesDiffer(value, module.conflicted[field].mine)) {
                 module.resolveConflict(field, 'mine');
             }
 
             if (module.refused[field]) {
                 if (!module.valuesDiffer(value, module.refused[field].value)) {
-                    // still the value REDCap would not take. Do not queue it and do
-                    // not pretend it is saved.
+                    // still the value REDCap refused, so do not queue it and do
+                    // not pretend it saved
                     delete module.pending[field];
                     module.showRefusal(field, module.refused[field].why);
                     return;
@@ -674,9 +623,8 @@ $(function() {
             }
         });
 
-        // a field that has left the page, hidden by branching or a repeating table
-        // redraw, cannot be re-read. If the server already agrees with what we
-        // last sent, stop carrying it, otherwise it is retried forever.
+        // A field that has left the page cannot be re-read. Drop it once the
+        // server agrees, or it is retried forever.
         Object.keys(module.pending).forEach(function(field) {
             if (module.readField(field) !== null) return;
             if (!module.valuesDiffer(module.pending[field], module.lastKnownServer[field])) delete module.pending[field];
@@ -707,9 +655,7 @@ $(function() {
         if (!cfg.syncEnabled || !module.running || !module.isLeader || module.stopped) return;
         if (module.busy) { module.scheduleFlush(); return; }
 
-        // anything the user still has to make a decision about stays out of the
-        // batch, otherwise it is re-sent every cycle and stacks up a new panel
-        // each time
+        // fields awaiting a decision stay out, or each cycle stacks a new panel
         let sendable = Object.keys(module.pending).filter(function(f) { return !module.conflicted[f]; });
 
         if (!sendable.length) { module.retryDelay = 0; module.setStatus(); return; }
@@ -731,11 +677,9 @@ $(function() {
         module.busy = true;
         module.setStatus('sending');
 
-        // Number every batch. A request that timed out is abandoned, not
-        // cancelled, so it can still arrive later and its answer would describe
-        // a world two edits out of date. Acting on it sets lastKnownServer back
-        // and leaves the screen and the database permanently disagreeing, with
-        // nothing left in the queue to correct it.
+        // Number every batch. A timed-out request is abandoned, not cancelled,
+        // so it can still land later describing a world two edits stale. Acting
+        // on that answer rolls lastKnownServer backwards.
         let seq = ++module.sendSeq;
         let stale = function() { return seq <= module.acceptedSeq; };
 
@@ -776,15 +720,14 @@ $(function() {
                     module.setStatus();
                     return;
                 }
-                // a hard error means nothing in the batch was written, so hold the
-                // queue and try again rather than dropping it on the floor
+                // nothing in the batch was written, so hold the queue
                 module.backOff();
                 return;
             }
 
             module.retryDelay = 0;
-            // recompute, do not delete. The user may well have kept typing while
-            // that request was in the air, and the value we sent is already stale.
+            // recompute rather than delete: they may have kept typing while
+            // that request was in the air
             module.recomputePending();
             module.saveDraft();
             module.setStatus();
@@ -799,9 +742,9 @@ $(function() {
     };
 
     /**
-     * A roaming tablet does not always get a refusal, it sometimes gets silence.
-     * Without this the promise never settles, busy stays true and the queue is
-     * wedged for the life of the page while the pill says it is waiting.
+     * A roaming tablet does not always get a refusal; sometimes it gets silence.
+     * Without a timeout, busy stays true and the queue is wedged for the life of
+     * the page while the pill claims to be waiting.
      */
     module.withTimeout = function(promise) {
         return new Promise(function(resolve, reject) {
@@ -856,8 +799,7 @@ $(function() {
         let clashes = Object.keys(module.conflicted).length;
         let stalled = module.stalledCount();
 
-        // these override whatever the caller asked for, because they are the
-        // states the user most needs to know about
+        // these outrank whatever the caller asked for
         if (module.storageBroken) state = 'broken';
         else if (module.stopped) state = 'stopped';
         else if (clashes) state = 'clash';
@@ -909,10 +851,9 @@ $(function() {
 
         $('<button type="button" class="asvo-btn asvo-btn-go">Put my answers back</button>')
             .on('click', function() {
-                // only the fields the draft recorded as unsaved. Everything else
-                // in the draft is a stale copy of what the server held when the
-                // page died, and writing it back would silently overwrite an edit
-                // somebody else has made since, with a baseline that matches.
+                // Only what the draft recorded as unsaved. The rest is a stale
+                // copy of the server's values, and rewriting it would overwrite
+                // somebody's later edit with a baseline that matches.
                 let skipped = module.writeForm(draft.values, draft.pending || draft.values);
                 module.noteChanges();
                 bar.remove();
@@ -990,9 +931,8 @@ $(function() {
     };
 
     /**
-     * REDCap would not take a value. Say so once, next to nothing, rather than
-     * retrying it silently every ten seconds until the tablet is closed. The
-     * panel goes away by itself when the field is corrected and saves.
+     * REDCap refused a value. Say so once rather than retrying it silently every
+     * ten seconds; the panel clears itself when the field saves.
      */
     module.showRefusal = function(field, why) {
         if ($('.asvo-refusal[data-asvo-field="' + module.sel(field) + '"]').length) return;
@@ -1034,8 +974,7 @@ $(function() {
         module.scrollTo(panel);
     };
 
-    // a 77 field form is a long way from top to bottom, and a panel prepended out
-    // of sight is a panel nobody reads
+    // a panel prepended out of sight on a long form is a panel nobody reads
     module.scrollTo = function(el) {
         try { el[0].scrollIntoView({ block: 'center' }); } catch (e) {}
     };
@@ -1047,11 +986,10 @@ $(function() {
     /* ------------------------------------------------------------------ */
 
     /**
-     * The handlers. 'change' on a text box only fires at blur, which is why an
-     * earlier version captured nothing from somebody who typed a paragraph and
-     * then walked away, so 'input' is bound as well and debounced. On top of
-     * that, anything that looks like the page is about to go away forces a save
-     * immediately rather than waiting for the timer.
+     * 'change' on a text box only fires at blur, so somebody who types a
+     * paragraph and walks away would be captured by nothing. Hence 'input' too,
+     * debounced. Anything that looks like the page is about to die forces a save
+     * rather than waiting for the timer.
      */
     module.bindHandlers = function() {
         let form = $('#form').length ? $('#form') : $(document);
@@ -1092,15 +1030,13 @@ $(function() {
         });
         $(window).on('offline', function() { module.setStatus('queued'); });
 
-        // The queue is deliberately NOT cleared here. An earlier version emptied
-        // it on submit, but REDCap cancels its own submit for required fields and
-        // validation, so a cancelled save silently threw away everything queued.
-        // All this does is remember that a real submit happened, so the draft is
-        // not offered to the next form this tab is pointed at.
+        // Deliberately does not clear the queue. REDCap cancels its own submit
+        // for required fields, and an earlier version threw away everything
+        // queued when that happened. This only notes that a submit occurred.
         form.on('submit', function() { module.markSubmitted(); });
     };
 
-    /** let a stopped module try once more */
+    /** a refusal can be permanent or merely current; let it try again */
     module.rearm = function() {
         if (!module.stopped) return;
         module.stopped = false;
@@ -1109,10 +1045,9 @@ $(function() {
     };
 
     module.start = async function() {
-        // Baseline first, before anything that can await. Opening IndexedDB and
-        // generating a 256 bit key together take long enough on a tablet that
-        // anything typed in the gap used to be read back as what the server
-        // already had, so it was never sent anywhere.
+        // Baseline before any await. Opening IndexedDB and generating a key take
+        // long enough on a tablet that anything typed in the gap would otherwise
+        // be mistaken for what the server already had.
         module.baseline = module.readForm();
         module.lastKnownServer = $.extend(true, {}, module.baseline);
         module.running = true;
@@ -1129,7 +1064,7 @@ $(function() {
             module.db = await module.openDb();
             module.cryptoKey = await module.loadKey();
         } catch (err) {
-            console.log('Auto-Save Value: no usable device storage', err);
+            console.log('Auto-Save Value: no usable device storage', err); // private browsing, most likely
             module.storageBroken = true;
             module.setStatus();
             module.recomputePending();      // the queue still works without a mirror
@@ -1165,10 +1100,10 @@ $(function() {
     };
 
     /**
-     * The server says these fields are on this instrument and are saveable. If
-     * the browser cannot find one, the module is silently doing nothing for it,
-     * which is exactly how checkbox support was broken for three review rounds
-     * behind a green test suite. Say so, loudly, in the console.
+     * If the server declared a field saveable and the browser cannot find it, the
+     * module is quietly doing nothing for that field. That is how checkbox
+     * support stayed broken through three review rounds behind a green suite, so
+     * complain in the console rather than shrug.
      */
     module.reportUnseenFields = function() {
         let unseen = Object.keys(cfg.fields).filter(function(f) { return module.readField(f) === null; });
@@ -1179,8 +1114,7 @@ $(function() {
             unseen);
     };
 
-    // On a brand new record syncEnabled comes back false, because there is no
-    // record on the server to write to. The device mirror still runs, so a reload
-    // does not lose the form; the queue simply stays shut until the record exists.
+    // On a new record syncEnabled is false: nothing on the server to write to
+    // yet. The device mirror still runs, so a reload does not lose the form.
     module.start();
 });

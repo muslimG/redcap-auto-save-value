@@ -1,6 +1,5 @@
 /* Auto-Save Value, offline layer
-   The status pill has to be readable from arm's length on a tablet propped up
-   next to a bed, hence the size and the colour coding rather than a small icon. */
+   */
 
 .asvo-status {
     position: fixed;
