@@ -1,46 +1,77 @@
 {
 	"name": "Auto-Save Value",
-	"namespace": "MCRI\\AutoSaveValue",
-	"description": "<code>@AUTOSAVE</code> action tags to trigger automatic saving of field values during data entry and/or on survey forms.",
+	"namespace": "SyedGilani\\AutoSaveValue",
+	"description": "<code>@AUTOSAVE</code> action tags to trigger automatic saving of field values during data entry and/or on survey forms, plus an optional offline layer for data entry forms that keeps an encrypted copy of the form on the device and retries saves when the connection returns. Adapted from <a href=\"https://github.com/lsgs/redcap-auto-save-value\">Auto-Save Value</a> by Luke Stevens, Murdoch Children's Research Institute; the action-tag half is his work.",
+	"documentation": "README.md",
 	"authors": [
 		{
-			"name": "Luke Stevens",
-			"email": "luke.stevens@mcri.edu.au",
-			"institution": "Murdoch Children's Research Institute"
+			"name": "Syed Gilani",
+			"email": "syed.gilani@thekids.org.au",
+			"institution": "The Kids Research Institute Australia"
 		}
 	],
-    "framework-version": 16,
-    "auth-ajax-actions": [ "save" ],
-    "no-auth-ajax-actions": [ "save" ],
-    "action-tags": [
-        {
-            "tag": "@AUTOSAVE",
-            "description": "Tag a text field with <code>@AUTOSAVE</code> to have the value saved automatically after its value is updated."
-        },
-        {
-            "tag": "@AUTOSAVE-FORM",
-            "description": "As <code>@AUTOSAVE</code>, but in data entry mode only, not in survey mode."
-        },
-        {
-            "tag": "@AUTOSAVE-SURVEY",
-            "description": "As <code>@AUTOSAVE</code>, but in survey mode only, not in data entry mode."
-        },
-        {
-            "tag": "@AUTOSAVE-FORM-HIDEICON",
-            "description": "As <code>@AUTOSAVE-FORM</code>, but suppress the field's save icon where in data entry mode it would normally be shown."
-        },
-        {
-            "tag": "@AUTOSAVE-SURVEY-SHOWICON",
-            "description": "As <code>@AUTOSAVE-SURVEY</code>, but show the field's save icon where in survey mode it would normally be suppressed."
-        }
-    ],
-    "system-settings": [ ],
+	"framework-version": 16,
+	"compatibility": {
+		"php-version-min": "7.4.0",
+		"redcap-version-min": "14.6.4"
+	},
+	"auth-ajax-actions": [ "save", "sync" ],
+	"no-auth-ajax-actions": [ "save" ],
+	"action-tags": [
+		{
+			"tag": "@AUTOSAVE",
+			"description": "Tag a text field with <code>@AUTOSAVE</code> to have the value saved automatically after its value is updated."
+		},
+		{
+			"tag": "@AUTOSAVE-FORM",
+			"description": "As <code>@AUTOSAVE</code>, but in data entry mode only, not in survey mode."
+		},
+		{
+			"tag": "@AUTOSAVE-SURVEY",
+			"description": "As <code>@AUTOSAVE</code>, but in survey mode only, not in data entry mode."
+		},
+		{
+			"tag": "@AUTOSAVE-FORM-HIDEICON",
+			"description": "As <code>@AUTOSAVE-FORM</code>, but suppress the field's save icon where in data entry mode it would normally be shown."
+		},
+		{
+			"tag": "@AUTOSAVE-SURVEY-SHOWICON",
+			"description": "As <code>@AUTOSAVE-SURVEY</code>, but show the field's save icon where in survey mode it would normally be suppressed."
+		}
+	],
+	"system-settings": [ ],
 	"project-settings": [
-        {
-            "key": "default-reason-for-change",
-            "name": "Text for \"reason for change\" (default is \"auto_save_value\")",
-            "type": "text",
-            "hidden": true
-        }
-    ]
+		{
+			"key": "offline-note",
+			"name": "<b>Offline layer</b><div class=\"cc_info\">Everything below is separate from the <code>@AUTOSAVE</code> action tags, which need no configuration. Choose the instruments to protect. Until at least one is chosen the offline layer does nothing, which is deliberate: it should not start writing to a form nobody asked it to. Data entry forms only, never surveys.</div>",
+			"type": "descriptive"
+		},
+		{
+			"key": "protected-instrument",
+			"name": "Instrument to protect",
+			"type": "form-list",
+			"repeatable": true
+		},
+		{
+			"key": "flush-seconds",
+			"name": "Seconds between background saves (default 10, minimum 3)",
+			"type": "text"
+		},
+		{
+			"key": "draft-ttl-hours",
+			"name": "Discard on-device drafts older than this many hours (default 12)",
+			"type": "text"
+		},
+		{
+			"key": "hide-status",
+			"name": "Hide the sync status indicator",
+			"type": "checkbox"
+		},
+		{
+			"key": "default-reason-for-change",
+			"name": "Text for \"reason for change\" (default is \"auto_save_value\")<div class=\"cc_info\">Used by both layers. Neither can stop and ask a human for a reason, so the same text is logged every time. If that is not acceptable for your audit trail, do not enable this module on that project.</div>",
+			"type": "text",
+			"hidden": true
+		}
+	]
 }
