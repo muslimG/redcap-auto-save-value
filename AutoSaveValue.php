@@ -25,10 +25,7 @@
  * The offline layer is new and runs on data entry forms only. It is switched on
  * per instrument in the project settings rather than per field, mirrors the form
  * into IndexedDB, and writes batches back through REDCap::saveData() with an
- * optimistic concurrency check. Because saveData is an API level write and
- * enforces none of the protections the data entry screen gives you for free,
- * checkCaller() re-checks all of them on every request. Get that wrong and the
- * module is a way to edit locked, signed or other people's records.
+ * optimistic concurrency check. 
  */
 
 namespace SyedGilani\AutoSaveValue;
@@ -85,9 +82,9 @@ class AutoSaveValue extends AbstractExternalModule
      * layer's list, because the queue can carry a checkbox group as a set where
      * a single-field save cannot. The ones left out are left out for a reason:
      *  - calc and @CALCTEXT recalculate on the server, so writing them is
-     *    pointless and would fight Data Quality rule H
+     *    pointless
      *  - file and signature cannot be sensibly held in a queue
-     *  - slider and rich text are not mirrored, and the restore bar says so
+     *  - slider and rich text are not mirrored
      */
     static $SyncableFieldTypes = [
         'checkbox',
@@ -365,13 +362,7 @@ class AutoSaveValue extends AbstractExternalModule
      * this one is chosen per instrument in the settings, that one per field by
      * action tag, and a field may quite reasonably be covered by both.
      */
-    /**
-     * May this field be written through the action-tag endpoint? It must exist on
-     * the instrument, have a metadata row (which excludes the _complete field),
-     * be a type the original module supports (which excludes calc), and carry an
-     * @AUTOSAVE tag appropriate to the mode. Survey mode is deliberately stricter
-     * because that endpoint is reachable without logging in.
-     */
+    
     protected function fieldMayAutoSave($field, $instrument) {
         global $Proj;
         if ($field === '') return false;
@@ -608,7 +599,7 @@ class AutoSaveValue extends AbstractExternalModule
 
 
     /* ---------------------------------------------------------------- */
-    /* offline layer, everything below is new                            */
+    /* offline layer, below is new                            */
     /* ---------------------------------------------------------------- */
 
     /**
