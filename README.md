@@ -28,8 +28,10 @@ entry forms and on surveys.
 
 **Layer two, the offline layer. New in this fork.**
 Switched on per instrument in the module configuration rather than per field.
-It mirrors the whole form into encrypted browser storage, and sends changed
-fields to the server on a queue that survives the connection going away.
+On data entry forms it mirrors the whole form into encrypted browser storage and
+sends changed fields to the server on a queue that survives the connection going
+away. On survey pages it does the first half only: the page is held on the device
+and offered back if the page reloads.
 
 The two layers do not interfere with each other. A field may be covered by both.
 
@@ -40,7 +42,7 @@ The two layers do not interfere with each other. A field may be covered by both.
 |---|---|---|
 | Chosen by | `@AUTOSAVE` on a field | instrument, in the config |
 | Data entry forms | yes | yes |
-| Surveys | yes | no |
+| Surveys | yes | held on the device and offered back after a reload; nothing sent |
 | Saves while offline | no, the save is lost | yes, queued and retried |
 | Copy of the form on the device | no | yes, encrypted |
 | Checkbox fields | no | yes |
@@ -90,7 +92,41 @@ On a record that has not been created yet, and on a page the user could not save
 by hand, the indicator stays grey: the form is mirrored to the device but nothing
 is sent.
 
-### Authorisation, and why layer two is not on surveys
+### Surveys
+
+The failure this exists for happens on surveys too: a parent is on page three of
+a questionnaire on a tablet, the tablet roams to another access point as the RA
+walks, Next is pressed, and the page comes back empty. The offline layer covers
+survey pages of every protected instrument, with two differences from data entry.
+
+Nothing is sent in the background. A survey respondent is not a logged-in REDCap
+user, so none of the checks the endpoint relies on mean anything, and the `sync`
+action is never reachable from a survey. The page is held on the device as the
+respondent types, and if the page reloads, whether from a network error, a
+refresh or a browser crash, the banner offers the answers back. Pressing Next
+then saves them exactly as it would have.
+
+There is no status indicator on a survey. The banner is the whole interface.
+
+Each page of a multi-page survey is held separately, keyed by the record and the
+page number, so page two is never offered page one's answers. Once a later page
+has loaded with a saved response, the earlier pages' rows have done their job and
+are removed, and the acknowledgement page at the end clears the respondent's rows
+from the device. A survey that ends by redirecting elsewhere skips the
+acknowledgement page, so its last page's row stays until the TTL; it is keyed by
+that respondent's record, so nobody else is offered it.
+
+**On a shared tablet, be aware:** the first page of a public survey has no record
+yet. If a respondent types on it and walks away without ever pressing Next, the
+next person to open that same public survey page on that tablet within the TTL
+will see the banner, and could put the previous person's answers back. The
+banner says how long ago they were typed, and Discard throws them away. If your
+public surveys collect anything sensitive on page one and the tablets are
+shared, set the TTL short, or protect only the instruments where this trade is
+worth it. Surveys opened from a participant's own link, or by an RA from the
+record, carry the record from the first page and are not affected.
+
+### Authorisation, and why the endpoint is not on surveys
 
 `REDCap::saveData()` is an API level write and enforces none of the protections
 the data entry screen gives you automatically, so the offline endpoint re-checks all
@@ -99,7 +135,7 @@ of them itself, on every request rather than once at page load:
 | Check | How |
 |---|---|
 | Instrument opted in | project setting, and nothing happens until one is chosen |
-| Form-level rights | `REDCap::getUserRights()`, edit rights only; a completed survey response also needs "edit survey responses". Administrators not on the project are treated as REDCap treats them |
+| Form-level rights | `REDCap::getUserRights()`, judged with REDCap's own `UserRights::hasDataViewingRights()`, which understands both the old 0 to 3 values and the bitmask REDCap 16 uses; a completed survey response also needs "edit survey responses". Administrators not on the project are treated as REDCap treats them |
 | Data access group | `Records::getRecordGroupId()`, then `getData` with `exportDataAccessGroups` |
 | Event | must be an event this project has, with this instrument designated |
 | Event and instance | the event must carry this instrument; an instance number on a form that does not repeat is ignored, and on a classic project the event is the project's only one, so neither can be used to aim past a lock |
@@ -130,8 +166,8 @@ dialog belongs to the offline layer.
 
 | Setting | Default | Notes |
 |---|---|---|
-| Which instruments to protect | none | **All instruments in this project**, including ones added later, or **only the instruments listed below**. Until one is chosen the offline layer does nothing |
-| Instrument to protect | none | Repeatable. Shown when "only the instruments listed below" is chosen. **Empty means the offline layer does nothing** |
+| Protect | none | **All instruments** (including ones added later) or **only those listed below**. Until one is chosen the offline layer does nothing. Applies to data entry forms and survey pages alike |
+| Instrument | none | Repeatable. Shown when "only those listed below" is chosen. **Empty means the offline layer does nothing** |
 | Seconds between background saves | 10 | Minimum 3 |
 | Discard on-device drafts older than | 12 hours | Range 1 to 168 |
 | Hide the sync status indicator | off | |
@@ -211,7 +247,7 @@ Two further gaps:
 ********************************************************************************
 ## Installing
 
-**The easy way.** Download `auto_save_value_v2.1.0.zip` from the
+**The easy way.** Download `auto_save_value_v2.2.0.zip` from the
 [Releases](https://github.com/muslimG/redcap-auto-save-value/releases) page, then
 in REDCap go to Control Center, External Modules, and upload it. The folder inside
 that zip is already named the way REDCap needs, so there is nothing to rename.
@@ -220,7 +256,7 @@ that zip is already named the way REDCap needs, so there is nothing to rename.
 
 **From a clone.** REDCap reads a module's version from its **directory name**,
 which must be `<prefix>_v<version>`, so a clone has to be copied into
-`redcap/modules/` as `auto_save_value_v2.1.0`. Only the module's own files belong
+`redcap/modules/` as `auto_save_value_v2.2.0`. Only the module's own files belong
 there: `AutoSaveValue.php`, `config.json`, `README.md`, `LICENSE`, `css/` and
 `js/`.
 
@@ -232,6 +268,15 @@ module configuration and chooses; the previous per-instrument list keeps working
 untouched in the meantime.
 
 ## Changes
+
+**2.2.0**
+- Survey pages are covered: held on the device, offered back after a reload,
+  nothing sent. See "Surveys" above.
+- Form-level rights as REDCap 16 encodes them (a bitmask from 128; 130 is view
+  and edit). Every user on such a server was being refused.
+- The target field of every randomisation model is excluded, with the right
+  argument order to REDCap's helper.
+- Shorter labels on the configuration page.
 
 **2.1.0**
 - Plain radio fields inside a conditional `@READONLY` (`@IF(..., @READONLY, ...)`)

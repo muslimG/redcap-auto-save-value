@@ -125,17 +125,89 @@ class AutoSaveValue extends AbstractExternalModule
     }
 
     public function redcap_survey_page(int $project_id, ?string $record, string $instrument, int $event_id, ?int $group_id, string $survey_hash, ?string $response_id, int $repeat_instance = 1) {
-        if (is_null($record)) return; // cannot autosave until record exists (not on new record or first page of public survey)
         global $pageFields;
-        $this->noauth = true;
-        $this->project_id = $project_id;
-        $this->record = $record;
-        $this->event_id = $event_id;
-        $this->instrument = $instrument;
-        $this->instance = $repeat_instance;
-        $pf=(isset($_GET['__page__'])) ? $pageFields[$this->escape($_GET['__page__'])] : array();
-        $this->includeSaveFunctions($pf);
+        $page = (isset($_GET['__page__']) && is_numeric($_GET['__page__']) && (int) $_GET['__page__'] > 0) ? (int) $_GET['__page__'] : 1;
+        $pf = (is_array($pageFields) && isset($pageFields[$page]) && is_array($pageFields[$page])) ? $pageFields[$page] : null;
+
+        // The action-tag layer cannot save until the record exists (not on the
+        // first page of a public survey). The offline layer runs regardless: on a
+        // survey it only mirrors the page to the device and offers it back after
+        // a reload, which needs no record and no login.
+        if (!is_null($record)) {
+            $this->noauth = true;
+            $this->project_id = $project_id;
+            $this->record = $record;
+            $this->event_id = $event_id;
+            $this->instrument = $instrument;
+            $this->instance = $repeat_instance;
+            $this->includeSaveFunctions(is_null($pf) ? array() : $pf);
+        }
+
+        if (is_array($pf) && !count($pf)) return; // the e-consent certification page: no fields to hold
+
+        $this->includeOfflineLayer($project_id, $record, $instrument, $event_id, $repeat_instance, [
+            'survey'     => true,
+            'hash'       => (string) $survey_hash,
+            'page'       => $page,
+            'pageFields' => $pf
+        ]);
     }
+    /**
+     * The survey is finished, so nothing this device holds for it is unsaved any
+     * more. Remove every row for this survey response, or the last page's
+     * answers would be offered to whoever opens that survey next on a shared
+     * tablet. Only the identifiers are needed here, so the module's JavaScript
+     * is not loaded; the few lines below do the one job.
+     */
+    public function redcap_survey_acknowledgement_page($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance = 1) {
+        if (!$this->instrumentIsProtected($instrument)) return;
+        $this->instrument = $instrument;
+        $this->aimAt($event_id, $repeat_instance);
+        $series = $this->surveySeries($project_id, $instrument);
+        $flags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
+        $seriesJson = json_encode($series, $flags);
+        $recordJson = json_encode(is_null($record) ? null : (string) $record, $flags);
+        if ($seriesJson === false || $recordJson === false) return;
+        ?>
+        <script type="text/javascript">
+        (function() {
+            var series = <?=$seriesJson?>, record = <?=$recordJson?>, tab = null;
+            try { tab = sessionStorage.getItem('asvo:tab'); } catch (e) {}
+            try {
+                var open = indexedDB.open('autoSaveValueOffline', 1);
+                // never create the database here: an empty one would break the
+                // module on this browser for good
+                open.onupgradeneeded = function() { try { open.transaction.abort(); } catch (e) {} };
+                open.onsuccess = function() {
+                    var db = open.result;
+                    if (!db.objectStoreNames.contains('drafts')) { db.close(); return; }
+                    var cursor = db.transaction('drafts', 'readwrite').objectStore('drafts').openCursor();
+                    cursor.onsuccess = function() {
+                        var c = cursor.result;
+                        if (!c) { db.close(); return; }
+                        var row = c.value;
+                        // only this respondent's rows: same record, or written by this tab
+                        if (row && row.series === series && ((record !== null && row.record === record) || (tab && row.tab === tab))) c.delete();
+                        c.continue();
+                    };
+                };
+            } catch (e) {}
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * One survey response's pages share this, whatever page, record or link hash
+     * they carry. The hash is deliberately left out: a public survey switches
+     * from the public link to the record's own link after its first page, so a
+     * series keyed by hash would split the response in two and page one's row
+     * would never be retired.
+     */
+    protected function surveySeries($project_id, $instrument) {
+        return implode('|', ['survey', (int) $project_id, (int) $this->event_id, $instrument, (int) $this->instance]);
+    }
+
     protected function filterPageFieldsByTag($pageFields, $tag) {
         global $Proj;
         $taggedFields = array();
@@ -392,7 +464,7 @@ class AutoSaveValue extends AbstractExternalModule
         return false;
     }
 
-    protected function includeOfflineLayer($project_id, $record, $instrument, $event_id, $repeat_instance) {
+    protected function includeOfflineLayer($project_id, $record, $instrument, $event_id, $repeat_instance, $survey = null) {
         if (!$this->instrumentIsProtected($instrument)) return;
 
         $this->project_id = $project_id;
@@ -400,6 +472,7 @@ class AutoSaveValue extends AbstractExternalModule
         $this->instrument = $instrument;
         $this->aimAt($event_id, $repeat_instance);
         $event_id = $this->event_id;
+        $onSurvey = is_array($survey) && !empty($survey['survey']);
 
         // No point offering to sync if the user could not save this form by hand.
         // Wrapped because checkCaller talks to the database, and a schema surprise
@@ -412,7 +485,12 @@ class AutoSaveValue extends AbstractExternalModule
         $mayWrite = false;
         $reason = '';
         try {
-            if (is_null($record)) {
+            if ($onSurvey) {
+                // A respondent is not a logged-in user, so none of the checks the
+                // endpoint relies on mean anything here. The page is mirrored to
+                // the device and offered back after a reload; nothing is sent.
+                $reason = 'This is a survey page. Answers are held on this device and offered back if the page reloads; nothing is sent in the background, because a survey respondent is not a logged-in user.';
+            } else if (is_null($record)) {
                 $reason = 'This record has not been created yet, so there is nothing on the server to save to. Background saving starts once the form is saved for the first time.';
             } else {
                 $this->refusalDetail = '';
@@ -428,6 +506,15 @@ class AutoSaveValue extends AbstractExternalModule
         $this->initializeJavascriptModuleObject();
 
         $fields = $this->syncableFields($instrument);
+        $uncovered = $this->uncoveredFields($instrument);
+
+        // A multi-page survey shows one page's fields at a time; the rest of the
+        // instrument is not on this page and must not be reported as missing.
+        if ($onSurvey && is_array($survey['pageFields'])) {
+            $onPage = array_flip($survey['pageFields']);
+            $fields = array_intersect_key($fields, $onPage);
+            $uncovered = array_intersect_key($uncovered, $onPage);
+        }
 
         // What the database holds right now, in display format, so the browser
         // does not have to guess it from the rendered form. The two differ on a
@@ -436,7 +523,7 @@ class AutoSaveValue extends AbstractExternalModule
         // screen as the server's word would raise a false conflict on the first
         // edit and, worse, never save the pre-filled values at all.
         $serverValues = null;
-        if ($mayWrite) {
+        if ($mayWrite || ($onSurvey && !is_null($record) && $record !== '')) {
             try {
                 $current = $this->currentValues(array_keys($fields), $fields);
                 $serverValues = [];
@@ -453,17 +540,21 @@ class AutoSaveValue extends AbstractExternalModule
             'eventId'       => (int) $event_id,
             'instrument'    => $instrument,
             'instance'      => (int) $this->instance,
-            'user'          => (defined('USERID')) ? USERID : '',
+            'user'          => $onSurvey ? 'survey' : ((defined('USERID')) ? USERID : ''),
+            'projectId'     => (int) $project_id,
+            'survey'        => $onSurvey,
+            'surveyHash'    => $onSurvey ? $survey['hash'] : '',
+            'page'          => $onSurvey ? (int) $survey['page'] : 1,
             'syncEnabled'   => $mayWrite,
             'syncReason'    => $reason,
             'flushSeconds'  => $this->flushSeconds(),
             'ttlHours'      => $this->ttlHours(),
-            'showStatus'    => !$this->getProjectSetting('hide-status'),
+            'showStatus'    => !$onSurvey && !$this->getProjectSetting('hide-status'),
             'syncAction'    => static::SYNC_ACTION,
             'fields'        => $fields,
             'serverValues'  => $serverValues,
             'skipFields'    => $this->unsyncableFields($instrument),
-            'uncovered'     => $this->uncoveredFields($instrument),
+            'uncovered'     => $uncovered,
             'version'       => isset($this->VERSION) ? $this->VERSION : ''
         ];
 
@@ -698,16 +789,15 @@ class AutoSaveValue extends AbstractExternalModule
                 return 'No rights in this project';
             }
         } else {
-            // 1 = view and edit, 3 = edit including survey responses. 0 is no access, 2 is read only.
             $formRight = isset($rights['forms'][$instrument]) ? (string) $rights['forms'][$instrument] : '0';
-            if ($formRight !== '1' && $formRight !== '3') {
-                $this->refusalDetail = 'User "'.$user.'" has form right '.$formRight.' on '.$instrument.' (1 or 3 is needed).';
+            if (!$this->formRightAllows($formRight, 'view-edit')) {
+                $this->refusalDetail = 'User "'.$user.'" has form right '.$formRight.' on '.$instrument.', which does not include view and edit.';
                 return 'No edit rights on this instrument';
             }
 
             // A completed survey response is read-only on the data entry screen
-            // unless the user holds "edit survey responses", which is right 3.
-            if ($formRight !== '3' && $this->isCompletedSurveyResponse($record, $instrument, $event_id, $instance)) {
+            // unless the user holds "edit survey responses".
+            if (!$this->formRightAllows($formRight, 'editresp') && $this->isCompletedSurveyResponse($record, $instrument, $event_id, $instance)) {
                 $this->refusalDetail = 'This is a completed survey response and user "'.$user.'" does not have "edit survey responses" on '.$instrument.'.';
                 return 'No edit rights on this instrument';
             }
@@ -760,6 +850,31 @@ class AutoSaveValue extends AbstractExternalModule
      * DAG" apart from "no such record" is a way to enumerate records.
      */
     protected $refusalDetail = '';
+
+    /**
+     * Does a form-level right grant what is asked. REDCap has two encodings and
+     * a live install turned up the second one: below 128 the value is the old
+     * 0 none, 1 view and edit, 2 read only, 3 edit survey responses; from 128 it
+     * is a bitmask, 128 marking the new scheme, 1 read only, 2 view and edit,
+     * 8 edit survey responses, 16 delete. So a plain "view and edit" user shows
+     * up as 130. REDCap's own helper is used when it exists, and the same rules
+     * are applied by hand when it does not.
+     */
+    protected function formRightAllows($value, $right) {
+        if (class_exists('\UserRights') && method_exists('\UserRights', 'hasDataViewingRights')) {
+            try { return (bool) \UserRights::hasDataViewingRights($value, $right); } catch (\Throwable $th) {}
+        }
+        if (!is_numeric($value) || $value === '') return false;
+        $value = (int) $value;
+        if ($value < 128) {
+            if ($right == 'view-edit') return $value == 1 || $value == 3;
+            if ($right == 'editresp')  return $value == 3;
+            return false;
+        }
+        if ($right == 'view-edit') return ($value & 2) == 2;
+        if ($right == 'editresp')  return ($value & 2) == 2 && ($value & 8) == 8;
+        return false;
+    }
 
     /**
      * This user's rights in the project, or null if they have none. Goes through
@@ -1021,7 +1136,7 @@ class AutoSaveValue extends AbstractExternalModule
 
             // the randomisation result is REDCap's to write, once, and saveData
             // refuses it afterwards; a draft carrying it would be refused every flush
-            if ($field === $this->randomizationField()) {
+            if (in_array($field, $this->randomizationFields(), true)) {
                 $out['uncovered'][$field] = 'randomisation field';
                 continue;
             }
@@ -1089,17 +1204,38 @@ class AutoSaveValue extends AbstractExternalModule
         return $this->classifyFields($instrument)['writable'];
     }
 
-    /** the randomisation target field, or null when the project has none */
+    /** the randomisation target fields, one per model; empty when the project has none */
+    protected $randomizationFields = null;
+
     protected function randomizationField() {
+        return $this->randomizationFields();
+    }
+
+    protected function randomizationFields() {
         global $Proj;
-        if (!isset($Proj->project['randomization']) || !$Proj->project['randomization']) return null;
-        if (!class_exists('\Randomization') || !method_exists('\Randomization', 'getRandomizationAttributes')) return null;
+        if (is_array($this->randomizationFields)) return $this->randomizationFields;
+        $out = [];
+        if (!isset($Proj->project['randomization']) || !$Proj->project['randomization']) return $this->randomizationFields = $out;
+        if (!class_exists('\Randomization') || !method_exists('\Randomization', 'getRandomizationAttributes')) return $this->randomizationFields = $out;
+
+        // a project may have several randomisation models, each with its own rid
+        $rids = [];
         try {
-            $attr = \Randomization::getRandomizationAttributes($Proj->project_id);
-            return (is_array($attr) && !empty($attr['targetField'])) ? $attr['targetField'] : null;
+            $result = $this->query('select rid from redcap_randomization where project_id = ?', [$Proj->project_id]);
+            while ($result && ($row = $result->fetch_assoc())) $rids[] = $row['rid'];
         } catch (\Throwable $th) {
-            return null;
+            $rids = [null]; // could not ask, so let REDCap pick its first model
         }
+        // randomisation switched on but no model set up yet: nothing to exclude
+
+        foreach ($rids as $rid) {
+            try {
+                // signature is (rid, project_id); null rid means the first model
+                $attr = \Randomization::getRandomizationAttributes($rid, $Proj->project_id);
+                if (is_array($attr) && !empty($attr['targetField'])) $out[] = $attr['targetField'];
+            } catch (\Throwable $th) {}
+        }
+        return $this->randomizationFields = array_values(array_unique($out));
     }
 
     /**

@@ -43,21 +43,21 @@
 	"project-settings": [
 		{
 			"key": "offline-note",
-			"name": "<b>Offline layer</b><div class=\"cc_info\">Everything below is separate from the <code>@AUTOSAVE</code> action tags, which need no configuration. Choose which instruments to protect. Until a choice is made the offline layer does nothing, which is deliberate: it should not start writing to a form nobody asked it to. Data entry forms only, never surveys.</div>",
+			"name": "<b>Offline layer</b><div class=\"cc_info\">Everything below is separate from the <code>@AUTOSAVE</code> action tags, which need no configuration. Choose which instruments to protect; \"all\" includes instruments added later. Until a choice is made the offline layer does nothing, which is deliberate: it should not start writing to a form nobody asked it to. On data entry forms it also saves in the background; on survey pages it holds the page on the device and offers it back after a reload, nothing more.</div>",
 			"type": "descriptive"
 		},
 		{
 			"key": "protect-scope",
-			"name": "Which instruments to protect",
+			"name": "Protect",
 			"type": "radio",
 			"choices": [
-				{ "value": "all", "name": "All instruments in this project, including ones added later" },
-				{ "value": "selected", "name": "Only the instruments listed below" }
+				{ "value": "all", "name": "All instruments" },
+				{ "value": "selected", "name": "Only those listed below" }
 			]
 		},
 		{
 			"key": "protected-instrument",
-			"name": "Instrument to protect",
+			"name": "Instrument",
 			"type": "form-list",
 			"repeatable": true,
 			"branchingLogic": {

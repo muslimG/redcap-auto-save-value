@@ -59,7 +59,19 @@ $(function() {
         return (cfg.record !== null && cfg.record !== '') ? cfg.record : 'new-record';
     };
 
-    module.baseKey = [cfg.user, module.recordKey(), cfg.eventId, cfg.instrument, cfg.instance].join('|');
+    // A survey page is keyed by page number as well: the respondent has no
+    // username, and a multi-page survey shows one page's fields at a time, so
+    // each page keeps its own row. The link hash is left out on purpose: a
+    // public survey moves from the public link to the record's own link after
+    // its first page, and a key carrying the hash would split one response in
+    // two. Event ids are unique across a REDCap server, and the project id is
+    // there for good measure.
+    module.baseKey = cfg.survey
+        ? ['survey', cfg.projectId || 0, module.recordKey(), cfg.eventId, cfg.instrument, cfg.instance, 'p' + (cfg.page || 1)].join('|')
+        : [cfg.user, module.recordKey(), cfg.eventId, cfg.instrument, cfg.instance].join('|');
+    // all pages of one survey response, whatever page or record they carry;
+    // must match surveySeries() on the server
+    module.series = cfg.survey ? ['survey', cfg.projectId || 0, cfg.eventId, cfg.instrument, cfg.instance].join('|') : null;
     module.lockName = 'asvo:sync:' + module.baseKey;
     module.leaseKey = 'asvo:lease:' + module.baseKey;
 
@@ -85,9 +97,11 @@ $(function() {
         };
 
         if (!stored) return Promise.resolve(mint());
-        if (!(navigator.locks && navigator.locks.request)) {
+        if (!(navigator.locks && navigator.locks.request) && !cfg.survey) {
             // Without Web Locks the liveness probe can miss a frozen original,
             // so only a reload, which cannot be a duplicate, keeps the token.
+            // Not on a survey: there, Next is a navigation, and the token has
+            // to survive it so earlier pages can be retired.
             let nav = (performance.getEntriesByType ? performance.getEntriesByType('navigation') : [])[0];
             if (nav && nav.type != 'reload' && nav.type != 'back_forward') return Promise.resolve(mint());
         }
@@ -294,6 +308,8 @@ $(function() {
                 });
                 await module.idbPut(module.STORE_DRAFTS, module.draftId, {
                     id: module.draftId,
+                    series: module.series,   // a survey's pages share this, so earlier pages can be retired
+                    page: cfg.survey ? (cfg.page || 1) : null,
                     savedAt: Date.now(),
                     hasPending: Object.keys(pending).length > 0 || held !== null, // a yes/no is not a secret, and it lets the scan skip clean rows
                     ttlHours: cfg.ttlHours,
@@ -539,6 +555,21 @@ $(function() {
         if (!row || !row.savedAt) return true;
         let limit = row.ttlHours ? row.ttlHours : cfg.ttlHours;
         return module.hoursSince(row.savedAt) > limit;
+    };
+
+    /**
+     * Reaching page N of a survey in this tab means pages before it were
+     * submitted and saved, so this tab's rows for them have done their job.
+     * Left behind, the first page's row of a public survey would be offered to
+     * the next respondent on a shared tablet.
+     */
+    module.retireEarlierPages = function() {
+        if (!module.series) return Promise.resolve();
+        return module.idbEachDraft(function(cursor) {
+            let row = cursor.value;
+            if (!row || row.series != module.series || row.tab != module.tabToken) return;
+            if (typeof row.page == 'number' && row.page < (cfg.page || 1)) cursor.delete();
+        });
     };
 
     module.purgeStaleDrafts = function() {
@@ -1040,6 +1071,9 @@ $(function() {
         if (!table.length) { module.host().prepend(panel); return; }
         panel.addClass('asvo-inform').insertBefore(table);
         module.fitPanels();
+        // a survey page keeps its table hidden until its own scripts have run
+        setTimeout(module.fitPanels, 600);
+        setTimeout(module.fitPanels, 2500);
     };
 
     module.fitPanels = function() {
@@ -1442,6 +1476,8 @@ $(function() {
         }
 
         try { await module.purgeStaleDrafts(); } catch (e) {}
+        // only once REDCap has a response for us: that is the proof the earlier pages were saved
+        if (cfg.survey && cfg.record) { try { await module.retireEarlierPages(); } catch (e) {} }
 
         // anything typed during those awaits is a real change, so pick it up now
         module.recomputePending();
@@ -1477,10 +1513,10 @@ $(function() {
         let uncovered = cfg.uncovered || {};
 
         console.log('Auto-Save Value offline layer ' + (cfg.version || '') + ': ' + covered.length + ' field' +
-            (covered.length == 1 ? '' : 's') + ' mirrored on ' + cfg.instrument + ', background saving ' +
-            (cfg.syncEnabled ? 'on' : 'OFF') + '.');
+            (covered.length == 1 ? '' : 's') + ' mirrored on ' + cfg.instrument + (cfg.survey ? ' (survey page ' + cfg.page + ')' : '') +
+            ', background saving ' + (cfg.syncEnabled ? 'on' : 'OFF') + '.');
 
-        if (!cfg.syncEnabled) {
+        if (!cfg.syncEnabled && !cfg.survey) {
             console.warn('Auto-Save Value: background saving is off on this page. ' + (cfg.syncReason || 'No reason was given.'));
         }
         if (Object.keys(uncovered).length) {
