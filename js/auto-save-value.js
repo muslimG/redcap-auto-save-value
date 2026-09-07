@@ -71,7 +71,9 @@ $(function() {
         : [cfg.user, module.recordKey(), cfg.eventId, cfg.instrument, cfg.instance].join('|');
     // all pages of one survey response, whatever page or record they carry;
     // must match surveySeries() on the server
-    module.series = cfg.survey ? ['survey', cfg.projectId || 0, cfg.eventId, cfg.instrument, cfg.instance].join('|') : null;
+    module.series = cfg.survey
+        ? ['survey', cfg.projectId || 0, cfg.eventId, cfg.instrument, cfg.instance].join('|')
+        : ['entry', cfg.projectId || 0, cfg.user].join('|');   // one user's data entry rows in this project
     module.lockName = 'asvo:sync:' + module.baseKey;
     module.leaseKey = 'asvo:lease:' + module.baseKey;
 
@@ -460,6 +462,39 @@ $(function() {
         });
     };
 
+    /**
+     * The framework runs every module.ajax() call through one promise queue, so
+     * two requests never overlap. Fine, except that a request whose fetch never
+     * settles, the classic roaming-tablet black hole, blocks that queue for the
+     * life of the page: our own 30 s timeout gives up on the promise, the next
+     * flush enqueues behind the hung fetch, and nothing leaves the browser again
+     * until a reload. Seen live: seven "sends", one request on the wire, pill
+     * flipping between Saving and Waiting for ever.
+     *
+     * The queue is looked up by property on every call, so it can be replaced
+     * with one that keeps the serialisation but moves on once a task has been
+     * silent for longer than our timeout. The task itself is returned untouched.
+     */
+    module.unwedgeFrameworkQueue = function() {
+        if (!window.ExternalModules || typeof ExternalModules.__ajaxQueue != 'function') return;
+        if (ExternalModules.__ajaxQueue.__asvo) return;
+        let queue = Promise.resolve();
+        let enqueue = function(requestFunc) {
+            let task = queue.then(requestFunc);
+            let release = new Promise(function(resolve) {
+                let done = false;
+                // a little longer than our own timeout, so our request gives up first
+                let timer = setTimeout(function() { if (!done) { done = true; resolve(); } }, module.AJAX_TIMEOUT + 1000);
+                let settle = function() { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+                task.then(settle, settle);
+            });
+            queue = release;
+            return task;
+        };
+        enqueue.__asvo = true;
+        ExternalModules.__ajaxQueue = enqueue;
+    };
+
     /** hold this tab's liveness lock for the life of the page */
     module.holdTabLock = function() {
         if (!(navigator.locks && navigator.locks.request)) return;
@@ -555,6 +590,26 @@ $(function() {
         if (!row || !row.savedAt) return true;
         let limit = row.ttlHours ? row.ttlHours : cfg.ttlHours;
         return module.hoursSince(row.savedAt) > limit;
+    };
+
+    /**
+     * A new record's first form is mirrored under 'new-record' because the
+     * record has no id until REDCap saves it. Once this tab is looking at a real
+     * record, that save happened, and the 'new-record' row it left behind must
+     * go: seen live, record 10-3's consent answers offered as unsaved on the
+     * blank consent form of record 10-4. Rows written by other tabs are left,
+     * because a tab that died before saving is exactly the case worth keeping.
+     * The other way for this tab to reach a saved record is to walk away from
+     * the new one through REDCap's "Leave site?" prompt, and a draft is a
+     * safety net for crashes and reloads, not for a form left on purpose.
+     */
+    module.retireNewRecordRows = function() {
+        if (!module.series || cfg.survey) return Promise.resolve();
+        return module.idbEachDraft(function(cursor) {
+            let row = cursor.value;
+            if (!row || row.series != module.series || row.tab != module.tabToken) return;
+            if (row.record === null || row.record === '') cursor.delete();
+        });
     };
 
     /**
@@ -740,7 +795,8 @@ $(function() {
      * rendering without ids. Values are compared as strings on purpose.
      */
     module.radioButton = function(field, value) {
-        let byId = document.getElementById('opt-' + field + '_' + value);
+        // opt- on an ordinary radio, mtxopt- on a matrix row
+        let byId = document.getElementById('opt-' + field + '_' + value) || document.getElementById('mtxopt-' + field + '_' + value);
         if (byId && byId.type == 'radio' && byId.name == field + '___radio') return $(byId);
         let group = $('input[type=radio][name="' + module.sel(field + '___radio') + '"]');
         return group.filter(function() { return String(this.value) === String(value); }).first();
@@ -1003,6 +1059,7 @@ $(function() {
             module.saveDraft();
             module.setStatus();
             if (Object.keys(module.pending).length) module.scheduleFlush();
+            else module.settleRedcapFlag();
         }).catch(function(err) {
             if (stale()) return;
             module.acceptedSeq = seq;
@@ -1010,6 +1067,22 @@ $(function() {
             console.log('Auto-Save Value: sync failed, keeping the queue', err);
             module.backOff();
         });
+    };
+
+    /**
+     * REDCap warns "Leave site?" whenever a field has changed since the page
+     * loaded. Once everything typed has reached the server that warning is a
+     * false alarm, and on a ward it teaches people to click through warnings.
+     * Lower the flag when nothing is outstanding and the form status dropdown,
+     * which this module never saves, is as it was. REDCap raises it again on
+     * the next keystroke by itself.
+     */
+    module.settleRedcapFlag = function() {
+        if (cfg.survey || typeof window.dataEntryFormValuesChanged == 'undefined') return;
+        if (Object.keys(module.pending).length || Object.keys(module.conflicted).length || module.stalledCount() || module.held) return;
+        let status = $('select[name="' + module.sel(cfg.instrument + '_complete') + '"]');
+        if (status.length && module.statusAtLoad !== null && String(status.val()) !== String(module.statusAtLoad)) return;
+        window.dataEntryFormValuesChanged = false;
     };
 
     /**
@@ -1253,7 +1326,7 @@ $(function() {
         let panel = $('<div class="asvo-bar asvo-clash"></div>').attr('data-asvo-field', clash.field);
 
         $('<div class="asvo-bar-text"></div>').html(
-            '<strong>Somebody else changed ' + module.escapeHtml(clash.field) + ' while you were offline.</strong><br>' +
+            '<strong>Somebody else changed "' + module.escapeHtml(module.labelOf(clash.field)) + '" while you were offline.</strong><br>' +
             'Yours: <code>' + module.escapeHtml(mine || '(blank)') + '</code> &nbsp; ' +
             'Already saved: <code>' + module.escapeHtml(theirs || '(blank)') + '</code><br>' +
             'You can also just correct the field itself, and your correction will be saved.'
@@ -1334,7 +1407,7 @@ $(function() {
 
         let panel = $('<div class="asvo-bar asvo-clash asvo-refusal"></div>').attr('data-asvo-field', field);
         $('<div class="asvo-bar-text"></div>').html(
-            '<strong>REDCap would not accept ' + module.escapeHtml(field) + ', so it has not been saved.</strong><br>' +
+            '<strong>REDCap would not accept "' + module.escapeHtml(module.labelOf(field)) + '", so it has not been saved.</strong><br>' +
             module.escapeHtml(why) + '<br>Correct the value and it will be sent again. Everything else on the form saved normally.'
         ).appendTo(panel);
 
@@ -1372,6 +1445,13 @@ $(function() {
     // a panel prepended out of sight on a long form is a panel nobody reads
     module.scrollTo = function(el) {
         try { el[0].scrollIntoView({ block: 'center' }); } catch (e) {}
+    };
+
+    /** the field's label as the server sent it, or its name if there is none */
+    module.labelOf = function(field) {
+        let spec = cfg.fields[field];
+        let label = spec && spec.label ? String(spec.label).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim() : '';
+        return label || field;
     };
 
     module.escapeHtml = function(s) {
@@ -1448,6 +1528,8 @@ $(function() {
         // long enough on a tablet that anything typed in the gap would otherwise
         // be mistaken for what the server already had.
         module.baseline = module.readForm();
+        let status = $('select[name="' + module.sel(cfg.instrument + '_complete') + '"]');
+        module.statusAtLoad = status.length ? String(status.val()) : null;
         module.lastKnownServer = module.serverSnapshot();
         module.serverAtLoad = $.extend(true, {}, module.lastKnownServer);
         module.running = true;
@@ -1456,6 +1538,7 @@ $(function() {
         module.tabToken = await module.settleTabToken();
         module.draftId = module.baseKey + '|' + module.tabToken;
         module.holdTabLock();
+        module.unwedgeFrameworkQueue();
         module.answerProbes();
         if (cfg.syncEnabled) module.electLeader();
         module.setStatus();
@@ -1478,6 +1561,8 @@ $(function() {
         try { await module.purgeStaleDrafts(); } catch (e) {}
         // only once REDCap has a response for us: that is the proof the earlier pages were saved
         if (cfg.survey && cfg.record) { try { await module.retireEarlierPages(); } catch (e) {} }
+        // likewise, a tab that has arrived at a saved record has saved its new record
+        if (!cfg.survey && cfg.record) { try { await module.retireNewRecordRows(); } catch (e) {} }
 
         // anything typed during those awaits is a real change, so pick it up now
         module.recomputePending();

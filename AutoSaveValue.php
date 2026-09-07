@@ -198,6 +198,55 @@ class AutoSaveValue extends AbstractExternalModule
     }
 
     /**
+     * "Save & Exit Form" on a brand new record lands on the record home page,
+     * where no form hook runs. The 'new-record' row that tab wrote is spent the
+     * moment the record exists, and if it were left, the next new record this
+     * tab creates would be offered the previous one's answers. So on the record
+     * home page of a record that exists, this tab's new-record rows are removed.
+     * Other tabs' rows are left: a tab that died before saving is the case worth
+     * keeping.
+     */
+    public function redcap_every_page_top($project_id) {
+        if (!defined('PAGE') || PAGE !== 'DataEntry/record_home.php') return;
+        if (empty($_GET['id']) || isset($_GET['auto'])) return;   // ?auto=1 is the not-yet-created record
+        if (!defined('USERID') || USERID === '') return;
+        if (!class_exists('\Records') || !method_exists('\Records', 'recordExists')) return;
+        try {
+            if (!\Records::recordExists($project_id, $_GET['id'])) return;
+        } catch (\Throwable $th) {
+            return;
+        }
+        $series = implode('|', ['entry', (int) $project_id, USERID]);
+        $json = json_encode($series, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+        if ($json === false) return;
+        ?>
+        <script type="text/javascript">
+        (function() {
+            var series = <?=$json?>, tab = null;
+            try { tab = sessionStorage.getItem('asvo:tab'); } catch (e) {}
+            if (!tab) return;
+            try {
+                var open = indexedDB.open('autoSaveValueOffline', 1);
+                open.onupgradeneeded = function() { try { open.transaction.abort(); } catch (e) {} };
+                open.onsuccess = function() {
+                    var db = open.result;
+                    if (!db.objectStoreNames.contains('drafts')) { db.close(); return; }
+                    var cursor = db.transaction('drafts', 'readwrite').objectStore('drafts').openCursor();
+                    cursor.onsuccess = function() {
+                        var c = cursor.result;
+                        if (!c) { db.close(); return; }
+                        var row = c.value;
+                        if (row && row.series === series && row.tab === tab && (row.record === null || row.record === '')) c.delete();
+                        c.continue();
+                    };
+                };
+            } catch (e) {}
+        })();
+        </script>
+        <?php
+    }
+
+    /**
      * One survey response's pages share this, whatever page, record or link hash
      * they carry. The hash is deliberately left out: a public survey switches
      * from the public link to the record's own link after its first page, so a
@@ -557,6 +606,10 @@ class AutoSaveValue extends AbstractExternalModule
             'uncovered'     => $uncovered,
             'version'       => isset($this->VERSION) ? $this->VERSION : ''
         ];
+
+        // a form with nothing this layer can hold (all calculated, all read-only,
+        // a table of descriptives) gets no layer and no indicator
+        if (!count($fields)) return;
 
         // JSON_HEX_TAG so a record id containing </script> cannot break out of the
         // block. Slashes stay escaped for the same reason.
@@ -1183,6 +1236,11 @@ class AutoSaveValue extends AbstractExternalModule
     protected function fieldEntry($meta) {
         $type = $meta['element_type'];
         $entry = ['type' => $type];
+        if (isset($meta['element_label'])) {
+            // for the panels, which should name a field the way the form does
+            $label = trim(preg_replace('/\s+/', ' ', strip_tags((string) $meta['element_label'])));
+            if ($label !== '') $entry['label'] = mb_substr($label, 0, 80);
+        }
 
         if ($type == 'checkbox') {
             // strval because php turns numeric array keys into ints, and the
@@ -1424,6 +1482,16 @@ class AutoSaveValue extends AbstractExternalModule
                 $seen = $this->offlineFormatSaveValue($field, $change['seen']);
 
                 if (!$this->sameValue($seen, $held)) {
+                    // The server has moved on from what the browser saw, but if it
+                    // moved to exactly this value there is nothing to argue about:
+                    // most often our own earlier request landed late, after the
+                    // browser had given up on it and sent again.
+                    $wanted = $this->offlineFormatSaveValue($field, $change['value']);
+                    if ($syncable[$field]['type'] == 'checkbox') $wanted = array_map('strval', (array) $change['value']);
+                    if ($this->sameValue($wanted, $held)) {
+                        $result['saved'][] = $field;
+                        continue;
+                    }
                     $result['conflicts'][] = [
                         'field'  => $field,
                         'mine'   => $change['value'],
@@ -1437,7 +1505,7 @@ class AutoSaveValue extends AbstractExternalModule
 
             if (count($toSave)) {
                 $outcome = $this->writeValues($toSave, $syncable);
-                $result['saved'] = $outcome['saved'];
+                $result['saved'] = array_values(array_unique(array_merge($result['saved'], $outcome['saved'])));
                 $result['notes'] = $outcome['notes'];
                 foreach ($outcome['failed'] as $field => $why) {
                     $result['rejected'][$field] = $why;
@@ -1723,12 +1791,32 @@ class AutoSaveValue extends AbstractExternalModule
                 $outcome['saved'][] = $field;
                 if (!empty($single['warnings'])) $outcome['notes'] = array_merge($outcome['notes'], $single['warnings']);
             } else {
-                $outcome['failed'][$field] = implode('; ', array_map('strval', $single['errors']));
-                \REDCap::logEvent('Auto-Save Value', "Rejected $field: ".$outcome['failed'][$field], '', $this->record, $this->event_id);
+                $outcome['failed'][$field] = $this->plainRefusal($single['errors']);
+                \REDCap::logEvent('Auto-Save Value', "Rejected $field: ".implode('; ', array_map('strval', $single['errors'])), '', $this->record, $this->event_id);
             }
         }
 
         return $outcome;
+    }
+
+    /**
+     * saveData explains a refusal in its import voice: "10-1","rand_dob",
+     * "2020-02-31","Invalid date format. (NOTE: Dates must be imported here
+     * only in Y-M-D format ...)". A research assistant at a bedside needs the
+     * middle of that, in plain words. The full text still goes to the log.
+     */
+    protected function plainRefusal($errors) {
+        $out = [];
+        foreach ((array) $errors as $error) {
+            $error = (string) $error;
+            // "record","field","value","message" -> message
+            if (preg_match('/^"[^"]*","[^"]*","[^"]*","(.*)"$/s', trim($error), $m)) $error = $m[1];
+            $error = preg_replace('/\s*\(NOTE:.*?\)\s*/s', ' ', $error);
+            $error = trim(preg_replace('/\s+/', ' ', $error));
+            if (stripos($error, 'Invalid date') !== false) $error = 'This is not a valid date.';
+            if ($error !== '') $out[] = $error;
+        }
+        return count($out) ? implode(' ', array_unique($out)) : 'REDCap did not accept this value.';
     }
 
     protected function saveRow($changes, $syncable) {

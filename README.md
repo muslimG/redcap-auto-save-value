@@ -247,7 +247,7 @@ Two further gaps:
 ********************************************************************************
 ## Installing
 
-**The easy way.** Download `auto_save_value_v2.2.0.zip` from the
+**The easy way.** Download `auto_save_value_v2.2.1.zip` from the
 [Releases](https://github.com/muslimG/redcap-auto-save-value/releases) page, then
 in REDCap go to Control Center, External Modules, and upload it. The folder inside
 that zip is already named the way REDCap needs, so there is nothing to rename.
@@ -256,7 +256,7 @@ that zip is already named the way REDCap needs, so there is nothing to rename.
 
 **From a clone.** REDCap reads a module's version from its **directory name**,
 which must be `<prefix>_v<version>`, so a clone has to be copied into
-`redcap/modules/` as `auto_save_value_v2.2.0`. Only the module's own files belong
+`redcap/modules/` as `auto_save_value_v2.2.1`. Only the module's own files belong
 there: `AutoSaveValue.php`, `config.json`, `README.md`, `LICENSE`, `css/` and
 `js/`.
 
@@ -268,6 +268,28 @@ module configuration and chooses; the previous per-instrument list keeps working
 untouched in the meantime.
 
 ## Changes
+
+**2.2.1**
+- A request that never answers (a wifi black hole rather than a refusal) no
+  longer wedges the External Module framework's shared request queue for the
+  life of the page. The module's own timeout already released its state; the
+  queue underneath did not move, so nothing left the browser again until a
+  reload.
+- A new record's first form is mirrored under "new record" because it has no id
+  yet. Once the same tab is looking at a saved record, that row is retired, so
+  the next new record on the tablet is not offered the last one's answers. Rows
+  left by a tab that closed before saving are kept, and REDCap's record home
+  page tidies the same rows when a save lands there.
+- A value REDCap ends up holding anyway (an identically-valued edit landing after
+  a late request) is reported as saved rather than as a conflict.
+- Refusals are worded plainly ("This is not a valid date.") instead of in
+  REDCap's import voice; the full text still goes to the project log.
+- Panels name fields by their label, not their variable name.
+- Forms with nothing coverable (descriptive text only) get no indicator.
+- Matrix radio buttons (`mtxopt-` ids) are restored like any other radio.
+- Once everything typed has reached the server, REDCap's "Leave site?" prompt is
+  lowered; it comes back on the next keystroke, and stays if the form status
+  dropdown was changed.
 
 **2.2.0**
 - Survey pages are covered: held on the device, offered back after a reload,
