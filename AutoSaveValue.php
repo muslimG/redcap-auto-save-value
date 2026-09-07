@@ -25,7 +25,10 @@
  * The offline layer is new and runs on data entry forms only. It is switched on
  * per instrument in the project settings rather than per field, mirrors the form
  * into IndexedDB, and writes batches back through REDCap::saveData() with an
- * optimistic concurrency check. 
+ * optimistic concurrency check. Because saveData is an API level write and
+ * enforces none of the protections the data entry screen gives you for free,
+ * checkCaller() re-checks all of them on every request. Get that wrong and the
+ * module is a way to edit locked, signed or other people's records.
  */
 
 namespace SyedGilani\AutoSaveValue;
@@ -82,9 +85,9 @@ class AutoSaveValue extends AbstractExternalModule
      * layer's list, because the queue can carry a checkbox group as a set where
      * a single-field save cannot. The ones left out are left out for a reason:
      *  - calc and @CALCTEXT recalculate on the server, so writing them is
-     *    pointless
+     *    pointless and would fight Data Quality rule H
      *  - file and signature cannot be sensibly held in a queue
-     *  - slider and rich text are not mirrored
+     *  - slider and rich text are not mirrored, and the restore bar says so
      */
     static $SyncableFieldTypes = [
         'checkbox',
@@ -362,7 +365,13 @@ class AutoSaveValue extends AbstractExternalModule
      * this one is chosen per instrument in the settings, that one per field by
      * action tag, and a field may quite reasonably be covered by both.
      */
-    
+    /**
+     * May this field be written through the action-tag endpoint? It must exist on
+     * the instrument, have a metadata row (which excludes the _complete field),
+     * be a type the original module supports (which excludes calc), and carry an
+     * @AUTOSAVE tag appropriate to the mode. Survey mode is deliberately stricter
+     * because that endpoint is reachable without logging in.
+     */
     protected function fieldMayAutoSave($field, $instrument) {
         global $Proj;
         if ($field === '') return false;
@@ -388,22 +397,56 @@ class AutoSaveValue extends AbstractExternalModule
 
         $this->project_id = $project_id;
         $this->record = $record;
-        $this->event_id = $event_id;
         $this->instrument = $instrument;
-        $this->instance = $repeat_instance ? $repeat_instance : 1;
+        $this->aimAt($event_id, $repeat_instance);
+        $event_id = $this->event_id;
 
         // No point offering to sync if the user could not save this form by hand.
         // Wrapped because checkCaller talks to the database, and a schema surprise
         // must degrade to "no background saving" rather than take the data entry
         // screen down with it.
+        // The reason a page is mirror-only is handed to the browser as well, so
+        // "why is the pill stuck on Held on this device" has a one-line answer in
+        // the console instead of a guess. It is not written to the project log:
+        // a read-only user opening a form is not an event worth recording.
         $mayWrite = false;
+        $reason = '';
         try {
-            $mayWrite = !is_null($record) && $this->checkCaller($project_id, $record, $instrument, $event_id, $this->instance) === true;
+            if (is_null($record)) {
+                $reason = 'This record has not been created yet, so there is nothing on the server to save to. Background saving starts once the form is saved for the first time.';
+            } else {
+                $this->refusalDetail = '';
+                $verdict = $this->checkCaller($project_id, $record, $instrument, $event_id, $this->instance);
+                if ($verdict === true) $mayWrite = true;
+                else $reason = trim($verdict.'. '.$this->refusalDetail);
+            }
         } catch (\Throwable $th) {
-            \REDCap::logEvent('Auto-Save Value offline layer', 'Stood down on this page: '.$th->getMessage(), '', $record, $event_id);
+            $reason = $th->getMessage();
+            \REDCap::logEvent('Auto-Save Value offline layer', 'Stood down on this page: '.$reason, '', $record, $event_id);
         }
 
         $this->initializeJavascriptModuleObject();
+
+        $fields = $this->syncableFields($instrument);
+
+        // What the database holds right now, in display format, so the browser
+        // does not have to guess it from the rendered form. The two differ on a
+        // form with no data yet: @DEFAULT, @SETVALUE, @TODAY and @NOW put values
+        // on screen that are not in the database, and a browser that took the
+        // screen as the server's word would raise a false conflict on the first
+        // edit and, worse, never save the pre-filled values at all.
+        $serverValues = null;
+        if ($mayWrite) {
+            try {
+                $current = $this->currentValues(array_keys($fields), $fields);
+                $serverValues = [];
+                foreach ($current as $field => $value) {
+                    $serverValues[$field] = is_array($value) ? $value : $this->formatDisplayValue($field, $value);
+                }
+            } catch (\Throwable $th) {
+                $serverValues = null; // the browser falls back to the screen
+            }
+        }
 
         $settings = [
             'record'        => $record,
@@ -412,12 +455,16 @@ class AutoSaveValue extends AbstractExternalModule
             'instance'      => (int) $this->instance,
             'user'          => (defined('USERID')) ? USERID : '',
             'syncEnabled'   => $mayWrite,
+            'syncReason'    => $reason,
             'flushSeconds'  => $this->flushSeconds(),
             'ttlHours'      => $this->ttlHours(),
             'showStatus'    => !$this->getProjectSetting('hide-status'),
             'syncAction'    => static::SYNC_ACTION,
-            'fields'        => $this->syncableFields($instrument),
-            'skipFields'    => $this->unsyncableFields($instrument)
+            'fields'        => $fields,
+            'serverValues'  => $serverValues,
+            'skipFields'    => $this->unsyncableFields($instrument),
+            'uncovered'     => $this->uncoveredFields($instrument),
+            'version'       => isset($this->VERSION) ? $this->VERSION : ''
         ];
 
         // JSON_HEX_TAG so a record id containing </script> cannot break out of the
@@ -599,7 +646,7 @@ class AutoSaveValue extends AbstractExternalModule
 
 
     /* ---------------------------------------------------------------- */
-    /* offline layer, below is new                            */
+    /* offline layer, everything below is new                            */
     /* ---------------------------------------------------------------- */
 
     /**
@@ -609,33 +656,149 @@ class AutoSaveValue extends AbstractExternalModule
      * Order matters a little: check the cheap things first so a hostile caller
      * cannot use the expensive ones to probe the database.
      */
+    /**
+     * Pin down which event and instance a request is about, before anything
+     * reads or writes. Two things arrive from the browser here and both were
+     * being trusted: on a form that does not repeat, an instance number other
+     * than 1 made the lock check look at an instance that does not exist, find
+     * nothing, and call the locked form unlocked, while the write itself still
+     * landed on the real form. On a classic project the event id is not part of
+     * the write at all, so it is replaced with the project's only event.
+     */
+    protected function aimAt($event_id, $repeat_instance) {
+        global $Proj;
+
+        $this->event_id = $event_id;
+        if (!\REDCap::isLongitudinal() && isset($Proj->firstEventId) && $Proj->firstEventId) {
+            $this->event_id = $Proj->firstEventId;
+        }
+
+        $wanted = (is_numeric($repeat_instance) && (int) $repeat_instance > 0) ? (int) $repeat_instance : 1;
+        $repeats = false;
+        if (isset($Proj) && method_exists($Proj, 'isRepeatingEvent') && method_exists($Proj, 'isRepeatingForm')) {
+            $repeats = $Proj->isRepeatingEvent($this->event_id) || $Proj->isRepeatingForm($this->event_id, $this->instrument);
+        }
+        $this->instance = $repeats ? $wanted : 1;
+    }
+
     protected function checkCaller($project_id, $record, $instrument, $event_id, $instance) {
         if (!$this->instrumentIsProtected($instrument)) return 'Instrument is not enabled for offline background saving';
 
         $user = (defined('USERID')) ? USERID : '';
         if ($user === '') return 'No user';
 
-        $allRights = \REDCap::getUserRights($user);
-        $rights = isset($allRights[$user]) ? $allRights[$user] : null;
-        if (is_null($rights)) return 'No rights in this project';
+        $rights = $this->rightsOf($project_id, $user);
 
-        // 1 = view and edit, 3 = edit including survey responses. 0 is no access, 2 is read only.
-        $formRight = isset($rights['forms'][$instrument]) ? (string) $rights['forms'][$instrument] : '0';
-        if ($formRight !== '1' && $formRight !== '3') return 'No edit rights on this instrument';
+        if (is_null($rights)) {
+            // An administrator who has not been added to the project has no
+            // rights row, yet REDCap lets them edit every form. Match that; the
+            // event and lock checks below still apply to them.
+            if (!$this->isSuperUser()) {
+                $this->refusalDetail = 'REDCap returned no rights for user "'.$user.'" in project '.$project_id.'.';
+                return 'No rights in this project';
+            }
+        } else {
+            // 1 = view and edit, 3 = edit including survey responses. 0 is no access, 2 is read only.
+            $formRight = isset($rights['forms'][$instrument]) ? (string) $rights['forms'][$instrument] : '0';
+            if ($formRight !== '1' && $formRight !== '3') {
+                $this->refusalDetail = 'User "'.$user.'" has form right '.$formRight.' on '.$instrument.' (1 or 3 is needed).';
+                return 'No edit rights on this instrument';
+            }
 
-        // a user inside a DAG may only touch records inside that DAG
-        if (!empty($rights['group_id'])) {
-            $recordGroup = $this->recordGroupId($project_id, $record);
-            if (is_null($recordGroup)) return 'Could not confirm which data access group this record belongs to';
-            if ((string) $recordGroup !== (string) $rights['group_id']) return 'Record belongs to another data access group';
+            // A completed survey response is read-only on the data entry screen
+            // unless the user holds "edit survey responses", which is right 3.
+            if ($formRight !== '3' && $this->isCompletedSurveyResponse($record, $instrument, $event_id, $instance)) {
+                $this->refusalDetail = 'This is a completed survey response and user "'.$user.'" does not have "edit survey responses" on '.$instrument.'.';
+                return 'No edit rights on this instrument';
+            }
+
+            // a user inside a DAG may only touch records inside that DAG
+            if (!empty($rights['group_id'])) {
+                $recordGroup = $this->recordGroupId($project_id, $record);
+                if (is_null($recordGroup)) {
+                    $this->refusalDetail = 'Neither Records::getRecordGroupId nor an export with DAGs returned a group for record "'.$record.'".';
+                    return 'Could not confirm which data access group this record belongs to';
+                }
+                if ((string) $recordGroup !== (string) $rights['group_id']) {
+                    $this->refusalDetail = 'Record is in group '.$recordGroup.', user "'.$user.'" is currently in group '.$rights['group_id'].'.';
+                    return 'Record belongs to another data access group';
+                }
+            }
         }
 
         if (!$this->eventHasInstrument($event_id, $instrument)) return 'That event does not have this instrument';
 
+        if ($this->recordIsLocked($project_id, $record)) return 'Form is locked';
         if ($this->formIsLocked($project_id, $record, $event_id, $instrument, $instance)) return 'Form is locked';
         if ($this->formIsSigned($project_id, $record, $event_id, $instrument, $instance)) return 'Form is e-signed';
 
         return true;
+    }
+
+    /**
+     * Has this survey response been completed. Only asked when the instrument is
+     * a survey; if REDCap cannot tell us, assume it has, because the alternative
+     * is letting a right-1 user edit a response the screen would have shown them
+     * read-only.
+     */
+    protected function isCompletedSurveyResponse($record, $instrument, $event_id, $instance) {
+        global $Proj;
+        if (!isset($Proj->forms[$instrument]['survey_id']) || !$Proj->forms[$instrument]['survey_id']) return false;
+        $surveyId = $Proj->forms[$instrument]['survey_id'];
+        if (!class_exists('\Survey') || !method_exists('\Survey', 'isResponseCompleted')) return true;
+        try {
+            return (bool) \Survey::isResponseCompleted($surveyId, $record, $event_id, $instance);
+        } catch (\Throwable $th) {
+            return true;
+        }
+    }
+
+    /**
+     * The specific reason behind the last generic refusal. Only ever shown on the
+     * data entry page, to a user who is already looking at the record, never
+     * returned from the sync endpoint: there, a message that tells "another
+     * DAG" apart from "no such record" is a way to enumerate records.
+     */
+    protected $refusalDetail = '';
+
+    /**
+     * This user's rights in the project, or null if they have none. Goes through
+     * the public API first; if that comes back empty, tries the class REDCap
+     * itself uses, because on some versions the API omits users whose rights come
+     * entirely from a role.
+     */
+    protected function rightsOf($project_id, $user) {
+        $allRights = \REDCap::getUserRights($user);
+        if (is_array($allRights) && isset($allRights[$user]) && is_array($allRights[$user])) return $allRights[$user];
+
+        if (class_exists('\UserRights') && method_exists('\UserRights', 'getPrivileges')) {
+            try {
+                $priv = \UserRights::getPrivileges($project_id, $user);
+                if (is_array($priv) && isset($priv[$project_id][$user]) && is_array($priv[$project_id][$user])) {
+                    $row = $priv[$project_id][$user];
+                    // this shape stores form rights as a string, "[form,1][other,3]"
+                    if (isset($row['data_entry']) && !isset($row['forms'])) {
+                        $row['forms'] = [];
+                        if (preg_match_all('/\[([^,\]]+),([^\]]*)\]/', (string) $row['data_entry'], $m, PREG_SET_ORDER)) {
+                            foreach ($m as $pair) $row['forms'][$pair[1]] = $pair[2];
+                        }
+                    }
+                    return $row;
+                }
+            } catch (\Throwable $th) {
+                // fall through to null
+            }
+        }
+
+        return null;
+    }
+
+    protected function isSuperUser() {
+        if (defined('SUPER_USER') && SUPER_USER) return true;
+        if (class_exists('\UserRights') && method_exists('\UserRights', 'isSuperUserNotImpersonator')) {
+            try { return (bool) \UserRights::isSuperUserNotImpersonator(); } catch (\Throwable $th) {}
+        }
+        return false;
     }
 
     /**
@@ -665,8 +828,9 @@ class AutoSaveValue extends AbstractExternalModule
 
     protected function recordGroupId($project_id, $record) {
         if (class_exists('\Records') && method_exists('\Records', 'getRecordGroupId')) {
+            // false means "no group", which is an answer, not a failure
             $group = \Records::getRecordGroupId($project_id, $record);
-            if (!is_null($group) && $group !== '') return $group;
+            if ($group !== false && !is_null($group) && $group !== '') return $group;
         }
 
         // second route: ask getData for the group and translate the unique name back
@@ -720,6 +884,16 @@ class AutoSaveValue extends AbstractExternalModule
         return $this->lockTableSays('redcap_locking_data', $project_id, $record, $event_id, $instrument, $instance);
     }
 
+    /**
+     * "Lock entire record" lives in its own table, redcap_locking_records, keyed
+     * by project, record and arm. The column discovery below reduces the query to
+     * project and record, which is the right question: a record locked on any
+     * arm is not something to write to in the background.
+     */
+    protected function recordIsLocked($project_id, $record) {
+        return $this->lockTableSays('redcap_locking_records', $project_id, $record, null, null, null);
+    }
+
     protected function formIsSigned($project_id, $record, $event_id, $instrument, $instance) {
         return $this->lockTableSays('redcap_esignatures', $project_id, $record, $event_id, $instrument, $instance);
     }
@@ -757,13 +931,14 @@ class AutoSaveValue extends AbstractExternalModule
         $args = [];
         if (in_array('project_id', $cols)) { $where[] = 'project_id = ?'; $args[] = $project_id; }
         $where[] = $recordCol.' = ?'; $args[] = $record;
-        if (in_array('event_id', $cols))  { $where[] = 'event_id = ?';  $args[] = $event_id; }
+        if (!is_null($event_id) && in_array('event_id', $cols))  { $where[] = 'event_id = ?';  $args[] = $event_id; }
 
-        // whole-record locks have no form name, so a null form_name must still count
-        if (in_array('form_name', $cols)) { $where[] = '(form_name = ? or form_name is null)'; $args[] = $instrument; }
+        // a null form_name would still count, defensively; whole-record locks are
+        // in fact a separate table, see recordIsLocked
+        if (!is_null($instrument) && in_array('form_name', $cols)) { $where[] = '(form_name = ? or form_name is null)'; $args[] = $instrument; }
 
         // instance is null for the first instance on most versions
-        if (in_array('instance', $cols)) { $where[] = 'coalesce(instance, 1) = ?'; $args[] = $instance; }
+        if (!is_null($instance) && in_array('instance', $cols)) { $where[] = 'coalesce(instance, 1) = ?'; $args[] = $instance; }
 
         $sql = 'select 1 from '.$table.' where '.implode(' and ', $where).' limit 1';
         $result = $this->query($sql, $args);
@@ -777,49 +952,7 @@ class AutoSaveValue extends AbstractExternalModule
      * wiping its siblings.
      */
     protected function syncableFields($instrument) {
-        global $Proj;
-        $fields = [];
-        if (!isset($Proj->forms[$instrument]['fields'])) return $fields;
-
-        foreach ($Proj->forms[$instrument]['fields'] as $field => $label) {
-            if ($field == $Proj->table_pk) continue;
-            if (!isset($Proj->metadata[$field])) continue; // no metadata row means no data, eg the _complete field
-            $meta = $Proj->metadata[$field];
-            if (!in_array($meta['element_type'], static::$SyncableFieldTypes)) continue;
-            if ($this->hasCalculatedActionTag($meta)) continue;
-
-            // @READONLY fields are not the user's to edit. REDCap drives them,
-            // usually with @SETVALUE inside an @IF, and it will put its own value
-            // back the moment the page recalculates. Writing them means fighting
-            // REDCap forever and raising a conflict on every flush. Found on a
-            // live project where 30 fields carry the tag.
-            if ($this->hasActionTag($meta, '@READONLY')) continue;
-
-            // a @RICHTEXT box keeps its content inside CKEditor until the form is
-            // submitted, so the underlying textarea reads stale. Mirroring it
-            // would quietly drop whatever the user actually wrote.
-            if ($this->hasActionTag($meta, '@RICHTEXT')) continue;
-
-            // ontology lookups are text fields carrying a service in element_enum.
-            // The box shows a label and stores a code, so reading .val() would save
-            // the wrong thing. Same reason AutoSaveValue leaves them alone.
-            if ($meta['element_type'] == 'text' && trim((string) $meta['element_enum']) !== '') continue;
-
-            $entry = ['type' => $meta['element_type']];
-
-            if ($meta['element_type'] == 'checkbox') {
-                // strval because php turns numeric array keys into ints, and the
-                // browser builds element names by gluing the code onto the field
-                $entry['choices'] = array_map('strval', array_keys(parseEnum($meta['element_enum'])));
-            }
-
-            $validation = (string) $meta['element_validation_type'];
-            if ($validation !== '') $entry['validation'] = $validation;
-
-            $fields[$field] = $entry;
-        }
-
-        return $fields;
+        return $this->classifyFields($instrument)['fields'];
     }
 
     /**
@@ -827,24 +960,172 @@ class AutoSaveValue extends AbstractExternalModule
      * calculated ones, which the server works out for itself.
      */
     protected function unsyncableFields($instrument) {
+        return $this->classifyFields($instrument)['skip'];
+    }
+
+    /**
+     * Fields on this instrument the offline layer is not covering, and why. Sent
+     * to the browser so the reason is one console line away instead of a guess.
+     * Two radio fields on a real project were left out because of a conditional
+     * @READONLY and it took a round of "it does not work for radios" to find.
+     */
+    protected function uncoveredFields($instrument) {
+        return $this->classifyFields($instrument)['uncovered'];
+    }
+
+    protected $classified = [];
+
+    protected function classifyFields($instrument) {
+        if (isset($this->classified[$instrument])) return $this->classified[$instrument];
+
         global $Proj;
-        $skip = [];
-        if (!isset($Proj->forms[$instrument]['fields'])) return $skip;
+        $out = ['fields' => [], 'writable' => [], 'skip' => [], 'uncovered' => []];
+        if (!isset($Proj->forms[$instrument]['fields'])) return $this->classified[$instrument] = $out;
 
         foreach ($Proj->forms[$instrument]['fields'] as $field => $label) {
-            if (!isset($Proj->metadata[$field])) continue;
+            if ($field == $Proj->table_pk) continue;
+            if (!isset($Proj->metadata[$field])) continue; // no metadata row, so nothing to hold
             $meta = $Proj->metadata[$field];
-            if ($meta['element_type'] == 'calc' || $this->hasCalculatedActionTag($meta)) {
-                $skip[] = $field;
+            $type = $meta['element_type'];
+
+            // The form status dropdown has a metadata row like any other field,
+            // but it is REDCap's own statement about the form and is set when
+            // the form is saved, so it is not ours to write in the background.
+            if ($field === $instrument.'_complete') {
+                $out['uncovered'][$field] = 'form status, set when the form is saved';
+                continue;
             }
+
+            if ($type == 'calc' || $this->hasCalculatedActionTag($meta)) {
+                // mirrored so a restore looks complete, never sent: the server
+                // works these out for itself
+                $out['skip'][] = $field;
+                $out['uncovered'][$field] = 'calculated by REDCap';
+                continue;
+            }
+
+            if ($type == 'descriptive' || $type == 'section_header') continue; // nothing to hold
+
+            if (!in_array($type, static::$SyncableFieldTypes)) {
+                $out['uncovered'][$field] = 'field type "'.$type.'" is not supported';
+                continue;
+            }
+
+            // ontology lookups are text fields carrying a service in element_enum.
+            // The box shows a label and stores a code, so reading .val() would save
+            // the wrong thing. Same reason AutoSaveValue leaves them alone.
+            if ($type == 'text' && trim((string) $meta['element_enum']) !== '') {
+                $out['uncovered'][$field] = 'ontology lookup';
+                continue;
+            }
+
+            // the randomisation result is REDCap's to write, once, and saveData
+            // refuses it afterwards; a draft carrying it would be refused every flush
+            if ($field === $this->randomizationField()) {
+                $out['uncovered'][$field] = 'randomisation field';
+                continue;
+            }
+
+            // Action tags are read after @IF has been resolved for this record,
+            // the same way REDCap itself reads them. Matching the raw annotation
+            // would treat @IF([x]='1', @READONLY, '') as read-only for everyone.
+            $annotation = $this->resolvedAnnotation($meta);
+
+            // @READONLY fields are not the user's to edit. REDCap drives them,
+            // usually with @SETVALUE, and it will put its own value back the
+            // moment the page recalculates. Writing them means fighting REDCap
+            // forever and raising a conflict on every flush. @READONLY-FORM is
+            // the same thing scoped to exactly where this layer runs.
+            //
+            // These two stay out of the browser's list but are still accepted by
+            // the endpoint (see 'writable'). Neither is a permission: REDCap does
+            // not enforce them on save, and a field that became read-only through
+            // an @IF after the page loaded still holds a value the user typed
+            // while it was editable.
+            if ($this->annotationHasTag($annotation, '@READONLY') || $this->annotationHasTag($annotation, '@READONLY-FORM')) {
+                $out['uncovered'][$field] = 'read-only on this page (@READONLY)';
+                $out['writable'][$field] = $this->fieldEntry($meta);
+                continue;
+            }
+
+            // a @RICHTEXT box keeps its content inside CKEditor until the form is
+            // submitted, so the underlying textarea reads stale. Mirroring it
+            // would quietly drop whatever the user actually wrote.
+            if ($this->annotationHasTag($annotation, '@RICHTEXT')) {
+                $out['uncovered'][$field] = 'rich text editor (@RICHTEXT)';
+                $out['writable'][$field] = $this->fieldEntry($meta);
+                continue;
+            }
+
+            $out['fields'][$field] = $this->fieldEntry($meta);
+            $out['writable'][$field] = $out['fields'][$field];
         }
 
-        return $skip;
+        return $this->classified[$instrument] = $out;
+    }
+
+    /** what the browser needs to know to read a field properly */
+    protected function fieldEntry($meta) {
+        $type = $meta['element_type'];
+        $entry = ['type' => $type];
+
+        if ($type == 'checkbox') {
+            // strval because php turns numeric array keys into ints, and the
+            // browser builds element names by gluing the code onto the field
+            $entry['choices'] = array_map('strval', array_keys(parseEnum($meta['element_enum'])));
+        }
+
+        $validation = (string) $meta['element_validation_type'];
+        if ($validation !== '') $entry['validation'] = $validation;
+
+        return $entry;
+    }
+
+    /**
+     * Everything the endpoint will write: the browser's list plus the fields
+     * left off it for display reasons rather than because writing them is wrong.
+     */
+    protected function writableFields($instrument) {
+        return $this->classifyFields($instrument)['writable'];
+    }
+
+    /** the randomisation target field, or null when the project has none */
+    protected function randomizationField() {
+        global $Proj;
+        if (!isset($Proj->project['randomization']) || !$Proj->project['randomization']) return null;
+        if (!class_exists('\Randomization') || !method_exists('\Randomization', 'getRandomizationAttributes')) return null;
+        try {
+            $attr = \Randomization::getRandomizationAttributes($Proj->project_id);
+            return (is_array($attr) && !empty($attr['targetField'])) ? $attr['targetField'] : null;
+        } catch (\Throwable $th) {
+            return null;
+        }
+    }
+
+    /**
+     * The field annotation with any @IF(...) resolved for the record on screen.
+     * REDCap's own helper does it; if this server does not have it, or it
+     * throws, fall back to the raw text, which is the behaviour before this fix.
+     */
+    protected function resolvedAnnotation($meta) {
+        $raw = (string) $meta['misc'];
+        if ($raw === '' || stripos($raw, '@IF') === false) return $raw;
+        if (!class_exists('\Form') || !method_exists('\Form', 'replaceIfActionTag')) return $raw;
+        try {
+            $resolved = \Form::replaceIfActionTag($raw, $this->project_id, $this->record, $this->event_id, $this->instrument, $this->instance);
+            return is_string($resolved) ? $resolved : $raw;
+        } catch (\Throwable $th) {
+            return $raw;
+        }
     }
 
     /** is this action tag present, as a whole word rather than a substring */
     protected function hasActionTag($meta, $tag) {
-        $annotation = strtoupper((string) $meta['misc']);
+        return $this->annotationHasTag((string) $meta['misc'], $tag);
+    }
+
+    protected function annotationHasTag($annotation, $tag) {
+        $annotation = strtoupper((string) $annotation);
         return (bool) preg_match('/(^|[^A-Z0-9_-])'.preg_quote($tag, '/').'($|[^A-Z0-9_-])/', $annotation);
     }
 
@@ -853,7 +1134,24 @@ class AutoSaveValue extends AbstractExternalModule
         return strpos($annotation, '@CALCTEXT') !== false || strpos($annotation, '@CALCDATE') !== false;
     }
 
+    /**
+     * "Protect every instrument" or "protect the ones listed". An install from
+     * before the scope setting existed has no value for it and keeps behaving as
+     * it did: only the listed instruments. Nothing configured means nothing
+     * protected, deliberately: the module should not start writing to a form
+     * nobody asked it to.
+     */
     protected function instrumentIsProtected($instrument) {
+        global $Proj;
+        if (!is_string($instrument) || $instrument === '') return false;
+
+        $scope = $this->getProjectSetting('protect-scope');
+        if ($scope === 'all') {
+            // still has to be a real instrument on this project
+            if (isset($Proj->forms) && is_array($Proj->forms)) return array_key_exists($instrument, $Proj->forms);
+            return true;
+        }
+
         $chosen = $this->getProjectSetting('protected-instrument');
         if (is_string($chosen) && $chosen !== '') $chosen = [$chosen]; // a single value need not be a list
         if (!is_array($chosen)) return false; // nothing configured yet, stay out of the way
@@ -890,13 +1188,13 @@ class AutoSaveValue extends AbstractExternalModule
      * and overwrite live data.
      */
     protected function syncBatch($payload, $project_id, $record, $instrument, $event_id, $repeat_instance) {
+        $this->project_id = $project_id;
         $this->record = $record;
-        $this->event_id = $event_id;
         $this->instrument = $instrument;
-        $this->instance = (is_numeric($repeat_instance) && (int) $repeat_instance > 0) ? (int) $repeat_instance : 1;
+        $this->aimAt($event_id, $repeat_instance);
+        $event_id = $this->event_id; // what the request said is no longer trusted below
 
         $result = ['saved' => [], 'conflicts' => [], 'rejected' => [], 'notes' => [], 'errors' => [], 'terminal' => false];
-
         try {
             if (is_null($record) || $record === '') throw new \Exception('No record to save to');
 
@@ -910,7 +1208,7 @@ class AutoSaveValue extends AbstractExternalModule
                 throw new \Exception('Too many fields in one batch');
             }
 
-            $syncable = $this->syncableFields($instrument);
+            $syncable = $this->writableFields($instrument);
 
             // work out which fields we are even willing to look at before going
             // anywhere near the database
@@ -1056,7 +1354,14 @@ class AutoSaveValue extends AbstractExternalModule
         ]);
 
         $eventData = $this->locateEventData($data);
-        if (is_null($eventData)) throw new \Exception('Could not read the current values for this record');
+        if (is_null($eventData)) {
+            // getData restricted to one event returns nothing at all for a
+            // record with no data in that event, which looks the same as a record
+            // that does not exist. Only the second is a failure, so ask again
+            // without the event restriction before deciding.
+            if ($this->recordExists()) $eventData = [];
+            else throw new \Exception('Could not read the current values for this record');
+        }
 
         $values = [];
         foreach ($fields as $field) {
@@ -1085,26 +1390,50 @@ class AutoSaveValue extends AbstractExternalModule
         return $values;
     }
 
+    /** does this record exist at all, in any event */
+    protected function recordExists() {
+        global $Proj;
+        if (class_exists('\Records') && method_exists('\Records', 'recordExists')) {
+            try { return (bool) \Records::recordExists($Proj->project_id, $this->record); } catch (\Throwable $th) {}
+        }
+        $data = \REDCap::getData([
+            'project_id'    => $Proj->project_id,
+            'records'       => [$this->record],
+            'fields'        => [$Proj->table_pk],
+            'return_format' => 'array'
+        ]);
+        return is_array($data) && isset($data[$this->record]);
+    }
+
     /**
      * getData nests differently for repeating forms, so dig out the right level
      * rather than assuming. Returns null when nothing matches, and the caller
      * treats that as a hard failure.
      */
     protected function locateEventData($data) {
-        if (!isset($data[$this->record])) return null;
+        global $Proj;
+        if (!isset($data[$this->record])) return null;   // no such record: a hard failure
         $recordData = $data[$this->record];
 
-        if (isset($recordData['repeat_instances'][$this->event_id][$this->instrument][$this->instance])) {
-            return $recordData['repeat_instances'][$this->event_id][$this->instrument][$this->instance];
-        }
-        if (isset($recordData['repeat_instances'][$this->event_id][''][$this->instance])) {
-            return $recordData['repeat_instances'][$this->event_id][''][$this->instance];
-        }
-        if (isset($recordData[$this->event_id])) {
-            return $recordData[$this->event_id];
+        $repeatingEvent = isset($Proj) && method_exists($Proj, 'isRepeatingEvent') && $Proj->isRepeatingEvent($this->event_id);
+        $repeatingForm  = isset($Proj) && method_exists($Proj, 'isRepeatingForm') && $Proj->isRepeatingForm($this->event_id, $this->instrument);
+
+        if ($repeatingEvent || $repeatingForm) {
+            // repeating data lives only under repeat_instances; a repeating
+            // event keys its forms under '', a repeating form under its name
+            $bucket = $repeatingEvent ? '' : $this->instrument;
+            if (isset($recordData['repeat_instances'][$this->event_id][$bucket][$this->instance])) {
+                return $recordData['repeat_instances'][$this->event_id][$bucket][$this->instance];
+            }
+            // the record exists and this is an instance nobody has saved yet:
+            // every field is empty, which is an answer rather than a failure
+            return [];
         }
 
-        return null;
+        if (isset($recordData[$this->event_id])) return $recordData[$this->event_id];
+
+        // record exists, this event has no data yet
+        return [];
     }
 
     /**
@@ -1280,7 +1609,9 @@ class AutoSaveValue extends AbstractExternalModule
                 // whole group, but only the part of the group this page could see.
                 $ticked = array_map('strval', $value);
                 foreach ($change['choices'] as $code) {
-                    $row[$field.'___'.$code] = in_array((string) $code, $ticked) ? '1' : '0';
+                    // REDCap names a negative code's column with an underscore in
+                    // place of the minus: field____1 for code -1, as export does
+                    $row[$field.'___'.str_replace('-', '_', (string) $code)] = in_array((string) $code, $ticked) ? '1' : '0';
                 }
             } else {
                 $row[$field] = $this->offlineFormatSaveValue($field, $value);

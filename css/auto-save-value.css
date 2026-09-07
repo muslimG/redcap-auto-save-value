@@ -15,7 +15,7 @@
     background-color: #f3f4f6;
     color: #374151;
     box-shadow: 0 1px 4px rgba(0,0,0,0.15);
-    pointer-events: none;
+    cursor: default;
 }
 
 .asvo-status.asvo-clean {
@@ -54,8 +54,8 @@
     border: 2px solid #b45309;
     border-left: 9px solid #b45309;
     border-radius: 8px;
-    padding: 14px 16px;
-    margin: 10px 0 16px 0;
+    padding: 12px 16px;
+    margin: 10px 0 12px 0;
     color: #7c2d12;
     font-family: Arial, Helvetica, sans-serif;
     display: flex;
@@ -63,6 +63,14 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+    box-sizing: border-box;
+    max-width: 100%;
+}
+
+/* sitting directly above the question table, sized to it by script so it lines
+   up with the form and stays clear of REDCap's floating save box */
+.asvo-bar.asvo-inform {
+    margin: 0 0 10px 0;
 }
 
 .asvo-bar.asvo-clash {

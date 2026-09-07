@@ -49,7 +49,11 @@ The two layers do not interfere with each other. A field may be covered by both.
 
 **On the device.** Every change is mirrored into IndexedDB, encrypted, about half
 a second after the typing stops. If the page reloads, redirects or crashes, the
-next time the form is opened the user is offered a one-click restore.
+next time the form is opened a banner above the form offers to put the unsaved
+answers back. The offer stays, reload after reload, until the user puts them back
+or presses Discard; it also gathers up work left behind by other tabs on the same
+record that are no longer open. Answers that are still not on the server expire
+with the draft TTL.
 
 **To the server.** Changed fields are batched and sent every ten seconds or so
 through the same external module AJAX channel, calling `REDCap::saveData()`. When
@@ -60,7 +64,9 @@ backoff, and immediately when the browser reports it is back online.
 believed the server held. If the server disagrees, someone edited the record
 while the change sat in the queue, so that field is refused and both values are
 handed back for the user to choose between. The rest of the batch still saves.
-The user can keep theirs, keep the other, or simply correct the field.
+The user can keep theirs, keep the other, or simply correct the field. The same
+check runs when a recovered draft is put back: a field a colleague changed in the
+meantime is shown as a choice, not written over.
 
 **Two tabs on one record.** Every tab mirrors to the device and keeps its own
 draft, so nothing typed anywhere is lost. Only one tab at a time is allowed to
@@ -68,12 +74,21 @@ send, chosen with the Web Locks API, which the browser releases automatically
 when that tab closes or crashes. On a browser without Web Locks there is a
 localStorage lease that stands down when it loses the record.
 
-**When something is not right.** If the browser cannot find a field the server
-declared saveable, it says so by name in the console at startup.
+**When something is not right.** The browser console gets one line at startup
+saying how many fields are covered and whether background saving is on. If it is
+off, the line says why (no edit rights, another data access group, a locked form,
+a record that does not exist yet). Fields on the instrument that are not covered
+are listed with the reason, and a field the server declared saveable but the page
+does not contain is named. `AutoSaveOffline.diagnose()` in the console returns
+the whole state as one object.
 
 **A status indicator** in the corner says which state you are in: all saved,
-holding changes on the device, another tab is saving, a value was not accepted, a
-change needs your decision, or the backup itself has failed.
+holding changes on the device, another tab has the connection, a value was not
+accepted, a change needs your decision, unsaved answers are being offered above,
+or the backup itself has failed. Hovering it gives the reason when saving is off.
+On a record that has not been created yet, and on a page the user could not save
+by hand, the indicator stays grey: the form is mirrored to the device but nothing
+is sent.
 
 ### Authorisation, and why layer two is not on surveys
 
@@ -84,10 +99,11 @@ of them itself, on every request rather than once at page load:
 | Check | How |
 |---|---|
 | Instrument opted in | project setting, and nothing happens until one is chosen |
-| Form-level rights | `REDCap::getUserRights()`, edit rights only |
+| Form-level rights | `REDCap::getUserRights()`, edit rights only; a completed survey response also needs "edit survey responses". Administrators not on the project are treated as REDCap treats them |
 | Data access group | `Records::getRecordGroupId()`, then `getData` with `exportDataAccessGroups` |
 | Event | must be an event this project has, with this instrument designated |
-| Record locking | `redcap_locking_data`, with the schema read from the database rather than assumed |
+| Event and instance | the event must carry this instrument; an instance number on a form that does not repeat is ignored, and on a classic project the event is the project's only one, so neither can be used to aim past a lock |
+| Record locking | `redcap_locking_data` for the form and `redcap_locking_records` for the whole record, with the schema read from the database rather than assumed |
 | E-signature | `redcap_esignatures`, likewise |
 
 The username comes from `USERID`, not from the request. That is exactly why the
@@ -114,7 +130,8 @@ dialog belongs to the offline layer.
 
 | Setting | Default | Notes |
 |---|---|---|
-| Instrument to protect | none | Repeatable. **Empty means the offline layer does nothing** |
+| Which instruments to protect | none | **All instruments in this project**, including ones added later, or **only the instruments listed below**. Until one is chosen the offline layer does nothing |
+| Instrument to protect | none | Repeatable. Shown when "only the instruments listed below" is chosen. **Empty means the offline layer does nothing** |
 | Seconds between background saves | 10 | Minimum 3 |
 | Discard on-device drafts older than | 12 hours | Range 1 to 168 |
 | Hide the sync status indicator | off | |
@@ -162,30 +179,74 @@ previewing an instrument in the Online Designer.
 
 ### Offline layer
 
-Checkbox fields **are** supported here. Still not written: calculated fields,
-which the server recalculates itself, file and signature fields, ontology
-lookups, sliders and rich text, the record ID and the form completion status.
+Checkbox fields **are** supported here, as are radio, yes/no, true/false,
+dropdown (including autocomplete and SQL), text in every validation, notes,
+and matrix rows. Still not written: calculated fields, which the server
+recalculates itself, file and signature fields, ontology lookups, sliders, rich
+text, the randomisation field, the record ID and the form completion status.
 `[form]_complete` is deliberately never written, so a form stays Incomplete until
-a user genuinely saves it.
+a user genuinely saves it. Fields that are read-only on the page (`@READONLY`,
+`@READONLY-FORM`, evaluated per record when inside `@IF`) are not mirrored,
+because REDCap drives them. The console lists every uncovered field on the
+instrument with its reason.
+
+Values REDCap pre-fills with `@DEFAULT`, `@SETVALUE`, `@TODAY` or `@NOW` are
+saved by the offline layer as REDCap itself would save them on Save, because the
+page is told what the database actually holds rather than guessing it from the
+screen.
 
 Two further gaps:
 
-- Fields populated by `@DEFAULT` or `@SETVALUE` are already on screen when the
-  page loads, so the offline layer reads them as values the server already has
-  and never sends them. The action-tag layer handles this case properly; if it
-  matters to you, tag those fields.
 - Up to about six tenths of a second of typing can be lost if the page dies
   before the debounce fires. The save attempted on `pagehide` is best effort and
   usually does not complete, because browsers do not wait for IndexedDB during
   unload.
+- The data entry form validates softly and still saves on Submit; the background
+  save goes through `REDCap::saveData()`, which validates hard. A value the form
+  would have accepted with a warning can therefore be refused in the background.
+  The refusal is shown above the form, the value stays on screen and in the draft,
+  and nothing else is held up.
 
 
 ********************************************************************************
 ## Installing
 
-**The easy way.** Download `auto_save_value_v2.0.0.zip` from the
+**The easy way.** Download `auto_save_value_v2.1.0.zip` from the
 [Releases](https://github.com/muslimG/redcap-auto-save-value/releases) page, then
 in REDCap go to Control Center, External Modules, and upload it. The folder inside
 that zip is already named the way REDCap needs, so there is nothing to rename.
 
 
+
+**From a clone.** REDCap reads a module's version from its **directory name**,
+which must be `<prefix>_v<version>`, so a clone has to be copied into
+`redcap/modules/` as `auto_save_value_v2.1.0`. Only the module's own files belong
+there: `AutoSaveValue.php`, `config.json`, `README.md`, `LICENSE`, `css/` and
+`js/`.
+
+**Updating.** Put the new version's directory alongside the old one, then in
+Control Center, External Modules, pick the new version for the module. REDCap
+keeps every project's settings across versions. The new "which instruments to
+protect" setting is empty on an updated project until an administrator opens the
+module configuration and chooses; the previous per-instrument list keeps working
+untouched in the meantime.
+
+## Changes
+
+**2.1.0**
+- Plain radio fields inside a conditional `@READONLY` (`@IF(..., @READONLY, ...)`)
+  were excluded for every record because the tag was matched in the raw
+  annotation. It is now resolved per record, as REDCap does.
+- The restore offer is persistent until answered, gathers work left by tabs that
+  are no longer open, and sits above the question table at its width.
+- Background saving being off is explained in the console and on the indicator.
+- "Which instruments to protect": all, or only the listed ones.
+- The page is told what the database holds, so `@DEFAULT` values are saved
+  rather than mistaken for saved, and a first edit no longer raises a false
+  conflict.
+- Whole-record locks are honoured; a made-up instance or event number can no
+  longer be aimed past a form lock; a completed survey response needs "edit
+  survey responses"; administrators not on the project are allowed, as REDCap
+  allows them.
+- A colleague's later edit is never overwritten by a restore; it is offered as a
+  choice.

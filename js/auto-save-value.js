@@ -47,11 +47,12 @@ $(function() {
     module.storageBroken = false;
     module.draftId = null;       // not known until the tab token is settled
     module.draftChain = Promise.resolve();
+    module.held = null;          // a draft offered on screen and not yet answered
+    module.savedHere = {};       // fields this page has saved since it loaded
     module.sendSeq = 0;          // every batch gets a number
     module.acceptedSeq = 0;      // the newest one whose answer we have used
 
     module.TAB_SLOT = 'asvo:tab';
-    module.SUBMIT_FLAG = 'asvo:submitted';
     module.CHANNEL = 'asvo-tabs';
 
     module.recordKey = function() {
@@ -84,22 +85,13 @@ $(function() {
         };
 
         if (!stored) return Promise.resolve(mint());
-        if (typeof BroadcastChannel == 'undefined') return Promise.resolve(stored);
-
-        return new Promise(function(resolve) {
-            let answered = false;
-            let probe = new BroadcastChannel(module.CHANNEL);
-
-            probe.onmessage = function(e) {
-                if (e.data && e.data.type == 'pong' && e.data.token == stored) answered = true;
-            };
-            probe.postMessage({ type: 'ping', token: stored });
-
-            setTimeout(function() {
-                probe.close();
-                resolve(answered ? mint() : stored);
-            }, module.TAB_PROBE);
-        });
+        if (!(navigator.locks && navigator.locks.request)) {
+            // Without Web Locks the liveness probe can miss a frozen original,
+            // so only a reload, which cannot be a duplicate, keeps the token.
+            let nav = (performance.getEntriesByType ? performance.getEntriesByType('navigation') : [])[0];
+            if (nav && nav.type != 'reload' && nav.type != 'back_forward') return Promise.resolve(mint());
+        }
+        return module.tabAlive(stored).then(function(alive) { return alive ? mint() : stored; });
     };
 
     module.answerProbes = function() {
@@ -110,26 +102,6 @@ $(function() {
                 module.channel.postMessage({ type: 'pong', token: module.tabToken });
             }
         };
-    };
-
-    /**
-     * Remember that a submit really happened, so a spent draft is not offered to
-     * whatever the tab loads next. Cleared again after two seconds, because
-     * REDCap cancels its own submit when a required field is empty.
-     */
-    module.markSubmitted = function() {
-        try { sessionStorage.setItem(module.SUBMIT_FLAG, String(Date.now())); } catch (e) {}
-        setTimeout(function() {
-            try { sessionStorage.removeItem(module.SUBMIT_FLAG); } catch (e) {}
-        }, 2000);
-    };
-
-    module.previousPageSubmitted = function() {
-        let flag = null;
-        try { flag = sessionStorage.getItem(module.SUBMIT_FLAG); } catch (e) {}
-        if (!flag) return false;
-        try { sessionStorage.removeItem(module.SUBMIT_FLAG); } catch (e) {}
-        return true;
     };
 
     /* ------------------------------------------------------------------ */
@@ -292,18 +264,38 @@ $(function() {
     };
 
     /**
+     * What a row holds, inside the encrypted blob:
+     *   values   the whole form as this tab last saw it
+     *   pending  this tab's own unsaved changes
+     *   seen     what this tab believed the server held for each field
+     *   held     answers recovered from an earlier page and not yet answered,
+     *            kept apart from pending so typing can never overwrite them
+     *
      * Chained behind any write already in flight. Two encrypts finishing out of
      * order would leave the older snapshot on disk, which is the one thing a
      * draft store must never do.
      */
     module.saveDraft = function() {
         if (!module.db || !module.cryptoKey || !module.draftId) return module.draftChain;
+        // nothing is written until the previous page's row has been read: a
+        // blur or a tab switch during startup used to overwrite it with a clean
+        // snapshot, and the offer it carried was gone before it was seen
+        if (!module.offerSettled) return module.draftChain;
 
         module.draftChain = module.draftChain.then(async function() {
             try {
-                let blob = await module.encrypt({ values: module.readForm(), pending: module.pending });
+                let pending = $.extend({}, module.pending);
+                let held = module.heldForStorage();
+                let blob = await module.encrypt({
+                    values: module.readForm(),
+                    pending: pending,
+                    seen: $.extend({}, module.lastKnownServer),
+                    held: held
+                });
                 await module.idbPut(module.STORE_DRAFTS, module.draftId, {
+                    id: module.draftId,
                     savedAt: Date.now(),
+                    hasPending: Object.keys(pending).length > 0 || held !== null, // a yes/no is not a secret, and it lets the scan skip clean rows
                     ttlHours: cfg.ttlHours,
                     base: module.baseKey,
                     tab: module.tabToken,
@@ -312,9 +304,11 @@ $(function() {
                     instrument: cfg.instrument,
                     blob: blob
                 });
+                module.lastWriteOk = true;
                 if (module.storageBroken) { module.storageBroken = false; module.setStatus(); }
             } catch (err) {
                 console.log('Auto-Save Value: could not write draft', err);
+                module.lastWriteOk = false;
                 module.storageBroken = true;
                 module.setStatus();
             }
@@ -323,54 +317,224 @@ $(function() {
     };
 
     /**
-     * Ours first; failing that, one orphaned by a tab that died on this record.
-     * Without the orphan scan, per-tab keys would make a crashed tab's work
-     * unreachable, which defeats the point.
+     * The offer as it should go to disk: what is still on offer, plus any
+     * "mine" from a clash raised while restoring, which is on no screen and in
+     * no pending set until the user answers it.
      */
-    module.readDraft = async function() {
-        let row = await module.idbGet(module.STORE_DRAFTS, module.draftId);
-        if (row && module.expired(row)) {
-            await module.idbDelete(module.STORE_DRAFTS, module.draftId);
-            row = null;
+    module.heldForStorage = function() {
+        let values = {}, seen = {}, since = null, sources = [];
+        if (module.held) {
+            values = $.extend({}, module.held.values);
+            seen = $.extend({}, module.held.seen);
+            since = module.held.since;
+            sources = module.held.sources.slice();
         }
-        if (!row) row = await module.findOrphanDraft();
-        if (!row) return null;
-
-        try {
-            let opened = await module.decrypt(row.blob);
-            opened.savedAt = row.savedAt;
-            opened.fromAnotherTab = (row.tab != module.tabToken);
-            return opened;
-        } catch (err) {
-            // Wrong key, so this draft belongs to another user on this tablet.
-            // Leave it: deleting someone else's unsaved work to tidy our own
-            // screen is not a trade worth making. TTL will clear it.
-            console.log('Auto-Save Value: a draft here could not be opened with this key, leaving it');
-            return null;
-        }
+        Object.keys(module.conflicted).forEach(function(field) {
+            let clash = module.conflicted[field];
+            if (!clash.apply) return;
+            values[field] = clash.mine;
+            if ('seen' in clash) seen[field] = clash.seen;
+            if (clash.since && (!since || clash.since < since)) since = clash.since;
+        });
+        if (!Object.keys(values).length) return null;
+        return { values: values, seen: seen, since: since || Date.now(), sources: sources };
     };
 
-    module.findOrphanDraft = async function() {
-        let candidates = [];
+    /**
+     * Everything this device holds for this record that the server does not,
+     * gathered into one offer. Our own row first, then rows left by tabs that
+     * are no longer alive, newest first; the first row to speak for a field
+     * wins. A row that has nothing to add and no living tab is deleted on the
+     * way past, or it would sit in front of older ones until the TTL.
+     */
+    module.collectOffer = async function() {
+        let rows = [];
         await module.idbEachDraft(function(cursor) {
             let row = cursor.value;
             if (!row || row.base != module.baseKey) return;
-            if (row.tab == module.tabToken) return;
             if (module.expired(row)) { cursor.delete(); return; }
-            candidates.push(row);
+            if (row.hasPending === false) return;
+            row.__key = cursor.primaryKey;
+            rows.push(row);
         });
-        if (!candidates.length) return null;
-        candidates.sort(function(a, b) { return b.savedAt - a.savedAt; });
-        return candidates[0];
+
+        rows.sort(function(a, b) {
+            if (a.tab == module.tabToken) return -1;
+            if (b.tab == module.tabToken) return 1;
+            return b.savedAt - a.savedAt;
+        });
+
+        let offer = { values: {}, seen: {}, fieldSince: {}, since: null, sources: [], fromAnotherTab: false };
+
+        for (let i = 0; i < rows.length; i++) {
+            let row = rows[i];
+            let own = (row.tab == module.tabToken);
+            if (!own && await module.tabAlive(row.tab)) continue;   // that tab is looking after its own work
+
+            let opened;
+            try { opened = await module.decrypt(row.blob); }
+            catch (err) {
+                // Wrong key, so this row belongs to another user on this tablet.
+                // Leave it: deleting someone else's unsaved work to tidy our own
+                // screen is not a trade worth making. The TTL will clear it.
+                console.log('Auto-Save Value: a draft here could not be opened with this key, leaving it');
+                continue;
+            }
+
+            let added = false;
+            let take = function(field, value, seenValue, since) {
+                if (!cfg.fields[field]) return;
+                if (!module.valuesDiffer(value, module.baseline[field])) return;   // the page already shows it
+                // newest answer for the field wins, whichever row it came from
+                if (field in offer.values && !(since && offer.fieldSince[field] && since > offer.fieldSince[field])) return;
+                offer.values[field] = value;
+                offer.fieldSince[field] = since || 0;
+                if (typeof seenValue != 'undefined') offer.seen[field] = seenValue; else delete offer.seen[field];
+                if (since && (!offer.since || since < offer.since)) offer.since = since;
+                added = true;
+            };
+
+            // that tab's own unsaved changes first, alive as of its last write:
+            // they are newer than anything it was itself still offering
+            let unsaved = module.unsavedIn(opened);
+            Object.keys(unsaved).forEach(function(field) {
+                take(field, unsaved[field], opened.seen ? opened.seen[field] : undefined, row.savedAt);
+            });
+
+            // then answers an earlier page was already offering, if they have not aged out
+            if (opened.held && opened.held.values && module.hoursSince(opened.held.since || row.savedAt) <= (row.ttlHours || cfg.ttlHours)) {
+                Object.keys(opened.held.values).forEach(function(field) {
+                    take(field, opened.held.values[field], opened.held.seen ? opened.held.seen[field] : undefined, opened.held.since || row.savedAt);
+                });
+                (opened.held.sources || []).forEach(function(id) { if (offer.sources.indexOf(id) < 0) offer.sources.push(id); });
+            }
+
+            if (own) continue;                       // our row is rewritten anyway
+            if (!added) { try { await module.idbDelete(module.STORE_DRAFTS, row.__key); } catch (e) {} continue; }
+            offer.fromAnotherTab = true;
+            if (offer.sources.indexOf(row.__key) < 0) offer.sources.push(row.__key);
+        }
+
+        return Object.keys(offer.values).length ? offer : null;
     };
 
+    /**
+     * Is the tab that minted this token still alive. Web Locks first: a tab
+     * holds a lock named after its token for as long as the page exists, so a
+     * frozen tab still counts as alive and a crashed or discarded one does not,
+     * with no waiting. Without Web Locks, ask over the channel and give it a
+     * moment to answer.
+     */
+    module.tabAlive = function(token) {
+        if (!token) return Promise.resolve(false);
+        if (navigator.locks && navigator.locks.request) {
+            return navigator.locks.request('asvo:tab:' + token, { ifAvailable: true }, function(lock) {
+                return lock === null;       // somebody else holds it, so they are alive
+            }).catch(function() { return false; });
+        }
+        if (typeof BroadcastChannel == 'undefined') return Promise.resolve(false);
+        return new Promise(function(resolve) {
+            let answered = false;
+            let probe = new BroadcastChannel(module.CHANNEL);
+            probe.onmessage = function(e) {
+                if (e.data && e.data.type == 'pong' && e.data.token == token) answered = true;
+            };
+            probe.postMessage({ type: 'ping', token: token });
+            setTimeout(function() { probe.close(); resolve(answered); }, module.TAB_PROBE);
+        });
+    };
+
+    /** hold this tab's liveness lock for the life of the page */
+    module.holdTabLock = function() {
+        if (!(navigator.locks && navigator.locks.request)) return;
+        navigator.locks.request('asvo:tab:' + module.tabToken, function() {
+            return new Promise(function() {});   // released by the browser when the page goes
+        }).catch(function() {});
+    };
+
+    /**
+     * Discard: forget the offer and remove the rows it was gathered from. Rows
+     * nobody was shown are left alone; a draft the user never saw is not
+     * something they agreed to throw away. Runs behind any write in flight so
+     * a save already past the fold cannot resurrect what was just discarded.
+     */
     module.dropDraft = function() {
-        if (!module.draftId) return Promise.resolve();
-        return module.idbDelete(module.STORE_DRAFTS, module.draftId);
+        let sources = module.held ? module.held.sources.slice() : [];
+        module.held = null;
+        if (!module.draftId || !module.db) return Promise.resolve();
+        module.draftChain = module.draftChain.then(async function() {
+            for (let i = 0; i < sources.length; i++) {
+                try { await module.idbDelete(module.STORE_DRAFTS, sources[i]); } catch (e) {}
+            }
+        });
+        return module.draftChain;
     };
 
-    // rows carry the TTL they were written under, so changing the setting does
-    // not retrospectively bin drafts that were still inside the old window
+    /** the source rows have done their job once our own row carries the answers */
+    module.releaseSources = function(sources) {
+        if (!sources || !sources.length || !module.db) return;
+        module.draftChain = module.draftChain.then(async function() {
+            if (!module.lastWriteOk) return;   // our row did not land, so theirs must stay
+            for (let i = 0; i < sources.length; i++) {
+                if (sources[i] == module.draftId) continue;
+                try { await module.idbDelete(module.STORE_DRAFTS, sources[i]); } catch (e) {}
+            }
+        });
+    };
+
+    /**
+     * The answers in a row that the server does not have: what it recorded as
+     * pending, or for a row written before pending was recorded, whatever
+     * differs from the values this page loaded with.
+     */
+    module.unsavedIn = function(draft) {
+        let out = {};
+        if (!draft || !draft.values) return out;
+        // a row with an empty pending set is a clean row, not a row from before
+        // pending was recorded; only the latter falls back to comparing values
+        let source = ('pending' in draft && draft.pending) ? draft.pending : draft.values;
+        Object.keys(source).forEach(function(field) {
+            if (!cfg.fields[field]) return;
+            let value = (field in draft.values) ? draft.values[field] : source[field];
+            if (module.valuesDiffer(value, module.baseline[field])) out[field] = value;
+        });
+        return out;
+    };
+
+    /** the offer, minus fields the user is typing in right now (hidden, not dropped) */
+    module.stillUnsaved = function(offer) {
+        let out = {};
+        if (!offer) return out;
+        Object.keys(offer.values).forEach(function(field) {
+            let live = module.readField(field);
+            if (live !== null && module.valuesDiffer(live, module.baseline[field])) return;
+            out[field] = offer.values[field];
+        });
+        return out;
+    };
+
+    /**
+     * Which offered fields somebody else changed between the draft and this
+     * page: the draft's idea of the server differs from what the server held
+     * when this page loaded. Never compared against the screen, which @DEFAULT
+     * may have pre-filled with something the database does not have, and not
+     * against what this page has saved since, which is our own doing.
+     */
+    module.contestedIn = function(offer, fields) {
+        let out = {};
+        if (!offer || !offer.seen) return out;
+        let server = module.serverAtLoad || module.lastKnownServer;
+        Object.keys(fields).forEach(function(field) {
+            if (!(field in offer.seen) || !(field in server)) return;
+            if (module.valuesDiffer(offer.seen[field], server[field])) out[field] = server[field];
+        });
+        return out;
+    };
+
+    // Rows age from their last write; a tab that is alive keeps its row fresh
+    // and a dead one stops. Offered answers age separately, from when they were
+    // first held, in collectOffer, so an ignored offer does not live for ever
+    // just because every page load rewrites the row that carries it.
     module.expired = function(row) {
         if (!row || !row.savedAt) return true;
         let limit = row.ttlHours ? row.ttlHours : cfg.ttlHours;
@@ -433,7 +597,7 @@ $(function() {
             return ticked;
         }
 
-        let input = $('[name="' + module.sel(field) + '"]').not('[type=radio]').first();
+        let input = module.mirrorInput(field);
         if (!input.length) return null;
         return input.val();
     };
@@ -454,6 +618,24 @@ $(function() {
             if (v !== null) values[field] = v;
         });
         return values;
+    };
+
+    /**
+     * What the server holds, as the starting point for the pending set. The
+     * page hands it over when it can; otherwise the screen has to stand in for
+     * it. The two differ on a form with no data yet, where @DEFAULT and friends
+     * pre-fill the screen: taking those as saved would raise a false conflict
+     * on the first edit and leave the pre-filled values unsaved for good.
+     */
+    module.serverSnapshot = function() {
+        let out = {};
+        let given = (cfg.serverValues && typeof cfg.serverValues == 'object') ? cfg.serverValues : null;
+        Object.keys(module.baseline).forEach(function(field) {
+            if (given && field in given) out[field] = given[field];
+            else if (given) out[field] = (cfg.fields[field].type == 'checkbox') ? [] : '';
+            else out[field] = module.baseline[field];
+        });
+        return out;
     };
 
     /**
@@ -482,9 +664,18 @@ $(function() {
                 module.clearRadio(field);
                 return;
             }
-            let button = $('input[type=radio][name="' + module.sel(field + '___radio') + '"][value="' + module.sel(value) + '"]');
+            let button = module.radioButton(field, value);
             if (button.length) {
                 if (!button.prop('checked')) button.trigger('click');
+                // REDCap's own click handler copies the value into the hidden
+                // mirror that actually gets submitted. If that did not happen,
+                // for whatever reason, do it by hand rather than leave the
+                // screen and the stored value disagreeing.
+                let mirror = module.mirrorInput(field);
+                if (mirror.length && String(mirror.val()) !== String(value)) {
+                    button.prop('checked', true);
+                    mirror.val(value).trigger('change');
+                }
                 return;
             }
             // No button carries this value: a missing-data code, or one hidden
@@ -493,11 +684,35 @@ $(function() {
             module.clearRadio(field);
         }
 
-        let input = $('[name="' + module.sel(field) + '"]').not('[type=radio]').first();
-        if (!input.length || input.val() == value) return;
+        let input = module.mirrorInput(field);
+        if (!input.length || String(input.val()) === String(value)) return false;
+        if (input.is('select') && String(value) !== '' && !input.find('option').filter(function() { return String(this.value) === String(value); }).length) {
+            // no such option: a code removed from the codebook or hidden with
+            // @HIDECHOICE. Setting it would make .val() read null and the field
+            // would quietly fall out of the mirror. Leave it and say so.
+            return false;
+        }
         input.val(value);
         module.syncAutocompleteLabel(input);
         input.trigger('change');
+        return true;
+    };
+
+    /** the element that carries a field's submitted value: never a radio button */
+    module.mirrorInput = function(field) {
+        return $('[name="' + module.sel(field) + '"]').not('[type=radio]').first();
+    };
+
+    /**
+     * One radio button. REDCap gives every button an id of opt-<field>_<code>,
+     * so look there first; the name-and-value selector is the fallback for a
+     * rendering without ids. Values are compared as strings on purpose.
+     */
+    module.radioButton = function(field, value) {
+        let byId = document.getElementById('opt-' + field + '_' + value);
+        if (byId && byId.type == 'radio' && byId.name == field + '___radio') return $(byId);
+        let group = $('input[type=radio][name="' + module.sel(field + '___radio') + '"]');
+        return group.filter(function() { return String(this.value) === String(value); }).first();
     };
 
     /**
@@ -509,10 +724,11 @@ $(function() {
      */
     module.clearRadio = function(field) {
         let group = $('input[type=radio][name="' + module.sel(field + '___radio') + '"]');
-        if (!group.filter(':checked').length) return;
+        let hidden = module.mirrorInput(field);
+        let mirrorHolds = hidden.length && String(hidden.val()) !== '';
+        if (!group.filter(':checked').length && !mirrorHolds) return;
 
         group.prop('checked', false);
-        let hidden = $('[name="' + module.sel(field) + '"]').not('[type=radio]').first();
         if (hidden.length) {
             hidden.val('');
             hidden.trigger('change');
@@ -530,6 +746,7 @@ $(function() {
             if (!(field in values)) return;
             let draftValue = values[field];
             let live = module.readField(field);
+            if (live === null) { skipped.push(field); return; }   // not on this page, so it stays held
             let draftBlank = (draftValue === '' || (Array.isArray(draftValue) && !draftValue.length));
             let liveBlank = (live === null || live === '' || (Array.isArray(live) && !live.length));
 
@@ -539,8 +756,13 @@ $(function() {
             // user has typed since, and that is theirs.
             let untouchedSinceLoad = !module.valuesDiffer(live, module.baseline[field]);
             if (!untouchedSinceLoad) { skipped.push(field); return; }
-            if (draftBlank && !liveBlank) { skipped.push(field); return; }
-            module.writeField(field, draftValue);
+            // With a pending-derived list a blank is a deliberate answer: the
+            // person cleared the field while offline. Only a whole-form draft
+            // from before pending was recorded gets the benefit of the doubt.
+            if (!onlyThese && draftBlank && !liveBlank) { skipped.push(field); return; }
+            let done = module.writeField(field, draftValue);
+            // a dropdown with no option for the value is left alone, and counted
+            if (done === false && module.valuesDiffer(module.readField(field), draftValue)) skipped.push(field);
         });
         module.recalculate();
         return skipped;
@@ -599,8 +821,15 @@ $(function() {
 
             // they have edited a field that was in conflict. Take that as the
             // answer: their correction wins.
-            if (module.conflicted[field] && module.valuesDiffer(value, module.conflicted[field].mine)) {
-                module.resolveConflict(field, 'mine');
+            if (module.conflicted[field]) {
+                let clash = module.conflicted[field];
+                // "edited since the clash was raised" is measured against what
+                // the box showed at that moment, not against the value that was
+                // in flight: they can differ if the person kept typing
+                if (module.valuesDiffer(value, clash.shown)) {
+                    clash.apply = false;   // the box holds their correction, do not overwrite it
+                    module.resolveConflict(field, 'mine', module.inFlush);
+                }
             }
 
             if (module.refused[field]) {
@@ -637,6 +866,7 @@ $(function() {
 
     module.noteChanges = function() {
         module.recomputePending();
+        module.refreshOffer();
         module.saveDraft();
         module.scheduleFlush();
         module.setStatus();
@@ -654,6 +884,12 @@ $(function() {
     module.flush = function() {
         if (!cfg.syncEnabled || !module.running || !module.isLeader || module.stopped) return;
         if (module.busy) { module.scheduleFlush(); return; }
+
+        // The screen is the truth, so read it again now. REDCap's expand-notes
+        // and missing-data dialogs live outside the form and write back with
+        // .val(), which fires nothing the handlers below would hear.
+        module.inFlush = true;
+        try { module.recomputePending(); } finally { module.inFlush = false; }
 
         // fields awaiting a decision stay out, or each cycle stacks a new panel
         let sendable = Object.keys(module.pending).filter(function(f) { return !module.conflicted[f]; });
@@ -695,6 +931,9 @@ $(function() {
 
             (response.saved || []).forEach(function(field) {
                 module.lastKnownServer[field] = batch[field].value;
+                // a real edit, as opposed to the module saving a value that
+                // REDCap pre-filled, is what moves a person past an old draft
+                if (module.valuesDiffer(batch[field].value, module.baseline[field])) module.savedHere[field] = true;
                 delete module.refused[field];
                 $('.asvo-refusal[data-asvo-field="' + module.sel(field) + '"]').remove();
             });
@@ -729,6 +968,7 @@ $(function() {
             // recompute rather than delete: they may have kept typing while
             // that request was in the air
             module.recomputePending();
+            module.refreshOffer();   // a field just saved leaves the offer
             module.saveDraft();
             module.setStatus();
             if (Object.keys(module.pending).length) module.scheduleFlush();
@@ -790,6 +1030,25 @@ $(function() {
         return $('body');
     };
 
+    /**
+     * Panels sit directly above the question table and take its width, so they
+     * line up with the form instead of running under REDCap's floating save
+     * box on the right. Pages without a question table get the old behaviour.
+     */
+    module.mount = function(panel) {
+        let table = $('#questiontable');
+        if (!table.length) { module.host().prepend(panel); return; }
+        panel.addClass('asvo-inform').insertBefore(table);
+        module.fitPanels();
+    };
+
+    module.fitPanels = function() {
+        let table = $('#questiontable');
+        if (!table.length) return;
+        let width = table.outerWidth();
+        $('.asvo-inform').css('width', width > 320 ? width + 'px' : '');
+    };
+
     module.setStatus = function(state) {
         if (!cfg.showStatus) return;
         let pill = $('#asvo-status');
@@ -798,12 +1057,14 @@ $(function() {
         let waiting = Object.keys(module.pending).length;
         let clashes = Object.keys(module.conflicted).length;
         let stalled = module.stalledCount();
+        let offered = module.held ? Object.keys(module.held.values).length : 0;
 
         // these outrank whatever the caller asked for
         if (module.storageBroken) state = 'broken';
         else if (module.stopped) state = 'stopped';
         else if (clashes) state = 'clash';
         else if (stalled) state = 'stalled';
+        else if (offered && !waiting) state = 'offered';
         else if (!state) {
             if (!cfg.syncEnabled) state = 'device-only';
             else if (!module.isLeader) state = 'standby';
@@ -811,6 +1072,7 @@ $(function() {
         }
 
         pill.removeClass('asvo-clean asvo-queued asvo-sending asvo-broken asvo-standby');
+        pill.attr('title', '');
 
         if (state == 'broken') {
             pill.addClass('asvo-broken').text('On-device backup FAILED');
@@ -820,10 +1082,21 @@ $(function() {
             pill.addClass('asvo-broken').text(clashes + (clashes == 1 ? ' change needs' : ' changes need') + ' your decision');
         } else if (state == 'stalled') {
             pill.addClass('asvo-broken').text(stalled + (stalled == 1 ? ' value was' : ' values were') + ' not accepted');
+        } else if (state == 'offered') {
+            // nothing queued on this page, but the banner above is holding
+            // answers the server does not have, so "all saved" would be a lie
+            pill.addClass('asvo-queued').text(offered + (offered == 1 ? ' unsaved answer' : ' unsaved answers') + ' held, see above');
         } else if (state == 'device-only') {
-            pill.addClass('asvo-standby').text(waiting ? 'Held on this device, not saved yet' : 'Held on this device');
+            // Mirror only, no background saving on this page. Amber once there
+            // is something on the device the server does not have; the reason
+            // the queue is shut sits in the tooltip and the console.
+            pill.addClass(waiting ? 'asvo-queued' : 'asvo-standby')
+                .text(waiting ? 'Held on this device only, not saved' : 'Held on this device')
+                .attr('title', 'Background saving is off on this page. ' + (cfg.syncReason || ''));
         } else if (state == 'standby') {
-            pill.addClass('asvo-standby').text(waiting ? 'Held on this device, another tab is saving' : 'Another tab is saving this record');
+            pill.addClass(waiting ? 'asvo-queued' : 'asvo-standby')
+                .text(waiting ? 'Held on this device only; another tab has the connection' : 'Another tab has the connection for this record')
+                .attr('title', 'Two tabs have this record open. Only one sends to the server, and each sends only what is typed in it.');
         } else if (state == 'sending') {
             pill.addClass('asvo-sending').text('Saving ' + waiting + ' change' + (waiting == 1 ? '' : 's'));
         } else if (state == 'queued') {
@@ -833,49 +1106,112 @@ $(function() {
         }
     };
 
-    module.showRestoreBar = function(draft) {
-        let minutes = Math.max(1, Math.round((Date.now() - draft.savedAt) / 60000));
-        let bar = $('<div class="asvo-bar"></div>');
-        let caveat = draft.fromAnotherTab
-            ? ' These came from another window on this device, so check they belong to this participant before putting them back.'
-            : '';
-
-        $('<div class="asvo-bar-text"></div>').html(
-            '<strong>Unsaved work found on this device.</strong> This form was being filled in about ' +
-            minutes + ' minute' + (minutes == 1 ? '' : 's') + ' ago and some answers never reached the server. ' +
-            'That usually means the page reloaded or the connection dropped.' + caveat +
-            ' Only fields this module can see are covered, so check the whole form afterwards.'
-        ).appendTo(bar);
-
+    /**
+     * Offer what the device holds. The offer stays, reload after reload, until
+     * the user puts the answers back or discards them: module.held is written
+     * into every draft in the meantime, apart from anything being typed.
+     */
+    module.showRestoreBar = function(offer) {
+        module.held = offer;
+        let bar = $('<div class="asvo-bar asvo-restore"></div>');
+        $('<div class="asvo-bar-text"></div>').appendTo(bar);
         let buttons = $('<div class="asvo-bar-buttons"></div>').appendTo(bar);
 
-        $('<button type="button" class="asvo-btn asvo-btn-go">Put my answers back</button>')
+        $('<button type="button" class="asvo-btn asvo-btn-go">Put them back</button>')
             .on('click', function() {
-                // Only what the draft recorded as unsaved. The rest is a stale
-                // copy of the server's values, and rewriting it would overwrite
-                // somebody's later edit with a baseline that matches.
-                let skipped = module.writeForm(draft.values, draft.pending || draft.values);
-                module.noteChanges();
-                bar.remove();
+                let remaining = module.stillUnsaved(module.held);
+                // Fields somebody else changed after the draft was written are
+                // not put back blind: the server's value is newer than the
+                // page the draft saw, so ask, the same way a live clash asks.
+                let contested = module.contestedIn(module.held, remaining);
+                let plain = {};
+                Object.keys(remaining).forEach(function(field) {
+                    if (!(field in contested)) plain[field] = remaining[field];
+                });
+
+                // Only what was recorded as unsaved. The rest of any draft is a
+                // stale copy of the server's values, and rewriting it would
+                // overwrite somebody's later edit with a baseline that matches.
+                let skipped = module.writeForm(module.held.values, plain);
+                let seen = $.extend({}, module.held.seen);   // a copy: the loop below trims the original
+                let since = module.held.since;
+
+                // what was put back, or handed to a clash, leaves the offer; a
+                // field the person is editing right now stays held, so nothing
+                // is lost if they change their mind
+                Object.keys(remaining).forEach(function(field) {
+                    if (skipped.indexOf(field) > -1) return;
+                    delete module.held.values[field];
+                    delete module.held.seen[field];
+                });
+                Object.keys(contested).forEach(function(field) {
+                    module.showConflict({
+                        field: field, mine: remaining[field], theirs: contested[field],
+                        apply: true, seen: seen[field], since: since
+                    });
+                });
+                module.noteChanges();   // refreshes the offer, releasing the sources once it is empty
                 if (skipped.length) {
-                    module.showNote('The draft was blank for ' + skipped.length + ' field' + (skipped.length == 1 ? '' : 's') +
-                                    ' you have already filled in since, so those were left as they are.');
+                    module.showNote(skipped.length + (skipped.length == 1 ? ' field' : ' fields') +
+                                    ' were left as they are, either because you are editing them or because they are not on this page, and are still held.');
                 }
             }).appendTo(buttons);
 
         $('<button type="button" class="asvo-btn">Discard</button>')
             .on('click', function() {
                 if (!confirm('Throw away the unsaved answers held on this device?')) return;
-                module.dropDraft();
                 bar.remove();
+                module.offerBar = null;
+                module.dropDraft().then(function() { module.saveDraft(); }, function() {});
+                module.setStatus();
             }).appendTo(buttons);
 
-        module.host().prepend(bar);
+        module.offerBar = bar;
+        module.mount(bar);
+        module.refreshOffer();
         module.scrollTo(bar);
+    };
+
+    /**
+     * Keep the offer honest while it sits there. A field this page has since
+     * saved by a real edit leaves the offer for good; a field being typed in is
+     * kept but flagged; when nothing is left the bar goes away on its own.
+     */
+    module.refreshOffer = function() {
+        if (!module.held) return;
+        Object.keys(module.held.values).forEach(function(field) {
+            if (module.savedHere[field]) { delete module.held.values[field]; delete module.held.seen[field]; }
+        });
+        if (!Object.keys(module.held.values).length) {
+            if (module.offerBar) module.offerBar.remove();
+            module.offerBar = null;
+            module.releaseSources(module.held.sources);
+            module.held = null;
+            module.saveDraft();
+            return;
+        }
+        if (!module.offerBar) return;
+        let count = Object.keys(module.held.values).length;
+        let editing = count - Object.keys(module.stillUnsaved(module.held)).length;
+        let text = '<strong>Unsaved answers found on this device.</strong> ' +
+            count + (count == 1 ? ' answer' : ' answers') + ' from ' + module.agoText(module.held.since) + ' never reached the server.';
+        if (editing) text += ' ' + editing + ' of them ' + (editing == 1 ? 'is' : 'are') + ' for a field you are editing now, which will be left as you have it.';
+        if (module.held.fromAnotherTab) text += ' They came from another window, so check they belong to this record.';
+        module.offerBar.find('.asvo-bar-text').html(text);
+    };
+
+    module.agoText = function(when) {
+        let minutes = Math.round((Date.now() - when) / 60000);
+        if (minutes < 2) return 'a moment ago';
+        if (minutes < 90) return minutes + ' minutes ago';
+        let hours = Math.round(minutes / 60);
+        if (hours < 36) return hours + ' hours ago';
+        return Math.round(hours / 24) + ' days ago';
     };
 
     module.showConflict = function(clash) {
         if (module.conflicted[clash.field]) return; // already asking about this one
+        clash.shown = module.readField(clash.field);   // what the box holds right now
         module.conflicted[clash.field] = clash;
 
         let mine = Array.isArray(clash.mine) ? clash.mine.join(', ') : clash.mine;
@@ -897,17 +1233,18 @@ $(function() {
         $('<button type="button" class="asvo-btn">Keep theirs</button>')
             .on('click', function() { module.resolveConflict(clash.field, 'theirs'); }).appendTo(buttons);
 
-        module.host().prepend(panel);
+        module.mount(panel);
         module.scrollTo(panel);
         module.setStatus();
     };
 
-    module.resolveConflict = function(field, side) {
+    module.resolveConflict = function(field, side, quiet) {
         let clash = module.conflicted[field];
         if (!clash) return;
 
         // their value becomes the base either way: it is what the server holds now
         module.lastKnownServer[field] = clash.theirs;
+        module.savedHere[field] = true;   // decided on this page, either way
         delete module.conflicted[field];
         delete module.refused[field];
         $('.asvo-clash[data-asvo-field="' + module.sel(field) + '"]').remove();
@@ -921,13 +1258,37 @@ $(function() {
             return;
         }
 
+        if (clash.apply) {
+            // a clash raised while restoring a draft: "mine" is not on screen
+            // yet, so put it there first
+            module.writeField(field, clash.mine);
+            module.recalculate();
+        }
+
         // read the box, do not trust the value that was in flight when the clash
         // happened. The user has very likely typed since.
         let live = module.readField(field);
-        if (live !== null) module.pending[field] = live;
+        if (live !== null) {
+            module.pending[field] = live;
+        } else if (clash.apply) {
+            // the field is not on this page, so there is nowhere to put "mine";
+            // keep holding it rather than lose it
+            module.holdAnswer(field, clash.mine, clash.seen, clash.since);
+        }
+        module.saveDraft();
         module.retryDelay = 0;
         module.setStatus();
-        module.flush();
+        // quiet when called from inside a flush, which sends anyway; a nested
+        // flush would send the same batch twice, the second with a stale seen
+        if (!quiet) module.flush();
+    };
+
+    /** put one answer (back) into the offer, creating it if need be */
+    module.holdAnswer = function(field, value, seen, since) {
+        if (!module.held) module.held = { values: {}, seen: {}, since: since || Date.now(), sources: [], fromAnotherTab: false };
+        module.held.values[field] = value;
+        if (typeof seen != 'undefined') module.held.seen[field] = seen;
+        if (since && since < module.held.since) module.held.since = since;
     };
 
     /**
@@ -943,7 +1304,7 @@ $(function() {
             module.escapeHtml(why) + '<br>Correct the value and it will be sent again. Everything else on the form saved normally.'
         ).appendTo(panel);
 
-        module.host().prepend(panel);
+        module.mount(panel);
         module.scrollTo(panel);
     };
 
@@ -960,7 +1321,7 @@ $(function() {
             .append($('<button type="button" class="asvo-btn asvo-btn-go">Try again</button>')
                 .on('click', function() { module.rearm(); module.retryDelay = 0; module.flush(); }))
             .appendTo(panel);
-        module.host().prepend(panel);
+        module.mount(panel);
         module.scrollTo(panel);
     };
 
@@ -970,7 +1331,7 @@ $(function() {
         $('<div class="asvo-bar-buttons"></div>')
             .append($('<button type="button" class="asvo-btn">OK</button>').on('click', function() { panel.remove(); }))
             .appendTo(panel);
-        module.host().prepend(panel);
+        module.mount(panel);
         module.scrollTo(panel);
     };
 
@@ -992,7 +1353,8 @@ $(function() {
      * rather than waiting for the timer.
      */
     module.bindHandlers = function() {
-        let form = $('#form').length ? $('#form') : $(document);
+        // the document, not #form: REDCap's dialogs are appended to body
+        let form = $(document);
 
         form.on('change blur', 'input, select, textarea', function() {
             clearTimeout(module.typingTimer);
@@ -1030,10 +1392,13 @@ $(function() {
         });
         $(window).on('offline', function() { module.setStatus('queued'); });
 
-        // Deliberately does not clear the queue. REDCap cancels its own submit
-        // for required fields, and an earlier version threw away everything
-        // queued when that happened. This only notes that a submit occurred.
-        form.on('submit', function() { module.markSubmitted(); });
+        // Nothing special happens on submit, deliberately. REDCap cancels its
+        // own submit for required fields, and an earlier version threw away the
+        // queue when that happened. A submit that does go through leaves the
+        // next page loaded with what was submitted, so the draft compares equal
+        // to the page and is dropped by the ordinary path; a version that noted
+        // the submit in sessionStorage and dropped the draft blind was found to
+        // delete answers that were still being offered.
     };
 
     /** a refusal can be permanent or merely current; let it try again */
@@ -1049,13 +1414,14 @@ $(function() {
         // long enough on a tablet that anything typed in the gap would otherwise
         // be mistaken for what the server already had.
         module.baseline = module.readForm();
-        module.lastKnownServer = $.extend(true, {}, module.baseline);
+        module.lastKnownServer = module.serverSnapshot();
+        module.serverAtLoad = $.extend(true, {}, module.lastKnownServer);
         module.running = true;
 
         module.bindHandlers();
-        let submitted = module.previousPageSubmitted();
         module.tabToken = await module.settleTabToken();
         module.draftId = module.baseKey + '|' + module.tabToken;
+        module.holdTabLock();
         module.answerProbes();
         if (cfg.syncEnabled) module.electLeader();
         module.setStatus();
@@ -1066,9 +1432,12 @@ $(function() {
         } catch (err) {
             console.log('Auto-Save Value: no usable device storage', err); // private browsing, most likely
             module.storageBroken = true;
+            module.offerSettled = true;
             module.setStatus();
             module.recomputePending();      // the queue still works without a mirror
             if (Object.keys(module.pending).length) module.scheduleFlush();
+            module.report();
+            $(window).on('resize', module.fitPanels);
             return;
         }
 
@@ -1077,41 +1446,73 @@ $(function() {
         // anything typed during those awaits is a real change, so pick it up now
         module.recomputePending();
 
-        if (submitted) {
-            // the previous page in this tab really was saved, so its draft is spent
-            try { await module.dropDraft(); } catch (e) {}
-        } else {
-            let draft = null;
-            try { draft = await module.readDraft(); } catch (e) {}
-
-            if (draft && draft.values) {
-                let unsaved = Object.keys(draft.values).some(function(field) {
-                    return module.valuesDiffer(draft.values[field], module.baseline[field]);
-                });
-                if (unsaved) module.showRestoreBar(draft);
-                else if (!draft.fromAnotherTab) await module.dropDraft(); // server already has it all
-            }
+        let offer = null;
+        try {
+            offer = await module.collectOffer();
+            module.offerSettled = true;
+        } catch (e) {
+            // Leave offerSettled false: nothing is written over the previous
+            // page's row until it has been read, and say so on the pill.
+            console.log('Auto-Save Value: could not read drafts', e);
+            module.storageBroken = true;
         }
+        if (offer) module.showRestoreBar(offer);
 
-        module.reportUnseenFields();
+        module.report();
         module.saveDraft();
         module.setStatus();
         if (Object.keys(module.pending).length) module.scheduleFlush();
+        $(window).on('resize', module.fitPanels);
     };
 
     /**
-     * If the server declared a field saveable and the browser cannot find it, the
-     * module is quietly doing nothing for that field. That is how checkbox
-     * support stayed broken through three review rounds behind a green suite, so
-     * complain in the console rather than shrug.
+     * One console line saying what this page is and is not doing, so the
+     * question "why is it not working for field X" has an answer without
+     * reading code. Nothing here is an error; warnings are used so the lines
+     * stand out in a console that REDCap fills with its own noise.
      */
-    module.reportUnseenFields = function() {
-        let unseen = Object.keys(cfg.fields).filter(function(f) { return module.readField(f) === null; });
-        if (!unseen.length) return;
-        console.warn('Auto-Save Value: ' + unseen.length + ' of ' + Object.keys(cfg.fields).length +
-            ' fields declared saveable on this instrument were not found in the page, so they are NOT being ' +
-            'protected. This usually means an unsupported field rendering. Please report it with this list: ',
-            unseen);
+    module.report = function() {
+        let covered = Object.keys(cfg.fields);
+        let unseen = covered.filter(function(f) { return module.readField(f) === null; });
+        let uncovered = cfg.uncovered || {};
+
+        console.log('Auto-Save Value offline layer ' + (cfg.version || '') + ': ' + covered.length + ' field' +
+            (covered.length == 1 ? '' : 's') + ' mirrored on ' + cfg.instrument + ', background saving ' +
+            (cfg.syncEnabled ? 'on' : 'OFF') + '.');
+
+        if (!cfg.syncEnabled) {
+            console.warn('Auto-Save Value: background saving is off on this page. ' + (cfg.syncReason || 'No reason was given.'));
+        }
+        if (Object.keys(uncovered).length) {
+            console.warn('Auto-Save Value: fields on this instrument that are NOT covered, and why:', uncovered);
+        }
+        if (unseen.length) {
+            console.warn('Auto-Save Value: ' + unseen.length + ' of ' + covered.length +
+                ' fields declared saveable on this instrument were not found in the page, so they are NOT being ' +
+                'protected. This usually means an unsupported field rendering. Please report it with this list: ',
+                unseen);
+        }
+    };
+
+    /** call AutoSaveOffline.diagnose() in the console to get the state as one object */
+    module.diagnose = function() {
+        return {
+            version: cfg.version,
+            instrument: cfg.instrument,
+            record: cfg.record,
+            syncEnabled: cfg.syncEnabled,
+            syncReason: cfg.syncReason,
+            isLeader: module.isLeader,
+            storageBroken: module.storageBroken,
+            stopped: module.stopped,
+            covered: Object.keys(cfg.fields),
+            notFoundOnPage: Object.keys(cfg.fields).filter(function(f) { return module.readField(f) === null; }),
+            uncovered: cfg.uncovered,
+            pending: module.pending,
+            conflicted: Object.keys(module.conflicted),
+            refused: module.refused,
+            heldAnswers: module.held ? module.held.values : null
+        };
     };
 
     // On a new record syncEnabled is false: nothing on the server to write to

@@ -43,14 +43,27 @@
 	"project-settings": [
 		{
 			"key": "offline-note",
-			"name": "<b>Offline layer</b><div class=\"cc_info\">Everything below is separate from the <code>@AUTOSAVE</code> action tags, which need no configuration. Choose the instruments to protect. Until at least one is chosen the offline layer does nothing, which is deliberate: it should not start writing to a form nobody asked it to. Data entry forms only, never surveys.</div>",
+			"name": "<b>Offline layer</b><div class=\"cc_info\">Everything below is separate from the <code>@AUTOSAVE</code> action tags, which need no configuration. Choose which instruments to protect. Until a choice is made the offline layer does nothing, which is deliberate: it should not start writing to a form nobody asked it to. Data entry forms only, never surveys.</div>",
 			"type": "descriptive"
+		},
+		{
+			"key": "protect-scope",
+			"name": "Which instruments to protect",
+			"type": "radio",
+			"choices": [
+				{ "value": "all", "name": "All instruments in this project, including ones added later" },
+				{ "value": "selected", "name": "Only the instruments listed below" }
+			]
 		},
 		{
 			"key": "protected-instrument",
 			"name": "Instrument to protect",
 			"type": "form-list",
-			"repeatable": true
+			"repeatable": true,
+			"branchingLogic": {
+				"field": "protect-scope",
+				"value": "selected"
+			}
 		},
 		{
 			"key": "flush-seconds",
